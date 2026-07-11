@@ -19,10 +19,18 @@ ANTI-HALLUCINATION (layered — Gemini is an assistant, not an ASR engine; on
 noisy/quiet/unclear audio it will happily INVENT fluent speech. No single
 prompt fixes that, so we stack independent guards):
   1. PROMPT     verbatim-only, "empty over guessing", partial-transcription
-                allowed (so it doesn't fill gaps to make sentences whole).
+                allowed (so it doesn't fill gaps to make sentences whole),
+                and MULTI-SPEAKER awareness: a clip can contain a speaker
+                change (interview turn-taking) — ALL audible speech must be
+                transcribed, not just the dominant voice. This was a real
+                cause of "missing sentences at speaker changes".
   2. ECHO GUARD output that parrots the task instruction -> dropped.
   3. CONTEXT-ECHO GUARD  output that merely repeats/continues the rolling
-                context (a classic LLM failure on near-silent audio) -> dropped.
+                context (a classic LLM failure on near-silent audio) ->
+                dropped. v3: threshold raised 20 -> 35 normalized chars so
+                SHORT conversational echoes (an interviewer repeating the
+                guest's phrase — completely normal speech) are no longer
+                silently deleted from the transcript.
   4. DENSITY GUARD  real speech is ~2-4 words/sec. If the "transcript" packs
                 > max_words_per_sec into the clip's duration, it was invented
                 -> dropped.
@@ -80,6 +88,13 @@ _ECHO_GUARD = {
 # segments of vocabulary/topic, small enough to keep calls fast and cheap.
 _MAX_CONTEXT_CHARS = 700
 
+# Context-echo guard: minimum normalized length before an output contained in
+# the rolling context is treated as a hallucinated replay. v3 raised this
+# from 20 to 35: real conversations echo short phrases constantly
+# (interviewer repeating the guest's words, "ඔව් ඔව් ඒක තමයි", "exactly,
+# exactly right") and the old cutoff was silently deleting them.
+_CONTEXT_ECHO_MIN_CHARS = 35
+
 SYSTEM_PROMPT = (
     "You are a strict speech-to-text transcription engine, not an assistant. "
     "Transcribe ONLY the words that are audibly spoken in THIS audio clip, "
@@ -88,6 +103,11 @@ SYSTEM_PROMPT = (
     "- Output only the verbatim words actually spoken. Do NOT translate, "
     "summarize, paraphrase, correct grammar, complete sentences, or clean up "
     "the speech.\n"
+    "- The clip may contain MORE THAN ONE speaker (e.g., an interview or "
+    "discussion where one person interrupts or replies to another). "
+    "Transcribe ALL audible speech from ALL speakers, in the order it is "
+    "spoken. Never transcribe only the louder or dominant voice and omit "
+    "the other.\n"
     "- The speakers are Sri Lankan and mix Sinhala, English and Tamil, often "
     "within one sentence. Keep every word in the language and script it was "
     "actually spoken in: Sinhala in Sinhala script, English in Latin script, "
@@ -99,9 +119,10 @@ SYSTEM_PROMPT = (
     "- Only if the audio is clearly a language OTHER than Sinhala, English or "
     "Tamil, return an empty 'text' and language 'other'.\n"
     "- If there is no intelligible speech (silence, breathing, background "
-    "noise, music, keyboard sounds), return an empty 'text'. This is the "
-    "CORRECT answer for such audio — never describe the sounds, never invent "
-    "speech for them.\n"
+    "noise, music, jingles, keyboard sounds), return an empty 'text'. This "
+    "is the CORRECT answer for such audio — never describe the sounds, never "
+    "invent speech for them. Music WITHOUT sung or spoken words is empty "
+    "text, always.\n"
     "- NEVER guess or invent speech. If the audio is too unclear to transcribe "
     "confidently, return an empty 'text' rather than a plausible-sounding "
     "sentence. An omission is acceptable; a fabrication is not.\n"
@@ -247,11 +268,13 @@ class GeminiProvider(SpeechProvider):
             return TranscriptResult(text="", language="other", confidence=None)
 
         # --- GUARD 3: context echo (hallucination on unclear audio often
-        # just replays/continues the rolling context). Only checked for
-        # non-trivial outputs so short genuine repeats like "හරි හරි" pass. ---
+        # just replays/continues the rolling context). Only fires for
+        # NON-TRIVIAL outputs (>= _CONTEXT_ECHO_MIN_CHARS normalized chars):
+        # short conversational echoes — an interviewer repeating a phrase —
+        # are genuine speech and must survive. ---
         if context:
             nt, nc = _norm(text), _norm(context)
-            if len(nt) > 20 and nt and nt in nc:
+            if len(nt) >= _CONTEXT_ECHO_MIN_CHARS and nt and nt in nc:
                 log.info(
                     "context-echo guard: output repeats rolling context, "
                     "dropping: %r",
