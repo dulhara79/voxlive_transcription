@@ -14,21 +14,25 @@ Two authentication modes for Gemini:
         GOOGLE_CLOUD_LOCATION=us-central1     # or "global"
         GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
-Speaker diarization (pyannote):
+Speaker diarization (pyannote) — v3 dual-threshold model:
         DIARIZATION_MODE=pyannote
         HUGGINGFACE_TOKEN=hf_...      # hf.co/settings/tokens
-        MAX_SPEAKERS=10
-        DIARIZATION_THRESHOLD=0.45    # TUNE THIS on your own mics — watch the
-                                      # "diarize: ... dist=" log lines and set
-                                      # the threshold between same-speaker and
-                                      # cross-speaker distance bands.
+        MAX_SPEAKERS=2                # set to the expected count when known!
+        DIARIZATION_THRESHOLD=0.45            # match threshold (same speaker)
+        DIARIZATION_NEW_SPEAKER_MARGIN=0.15   # + margin -> create threshold
+        MIN_NEW_SPEAKER_SEC=2.0
+   Distances <= threshold             -> same speaker
+   threshold < d <= threshold+margin  -> nearest speaker, embedding NOT stored
+   d > threshold+margin               -> new speaker (if long enough + capped)
+   TUNE via the "diarize: ... dist=" log lines: same-speaker distances must
+   fall below the threshold, cross-speaker above threshold+margin.
    NOTE: pyannote/embedding is a GATED model — you must (once) visit
    https://hf.co/pyannote/embedding while logged in and accept the conditions,
    otherwise loading fails with 401.
 
 Latency: GEMINI_MODEL=gemini-2.5-flash-lite is noticeably faster/cheaper than
 gemini-2.5-flash with a small accuracy cost — worth A/B testing for the live
-demo. Diarization now runs in parallel with the Gemini call (free).
+demo. Diarization runs in parallel with the Gemini call (free).
 """
 
 import os
@@ -86,7 +90,11 @@ class Settings:
     # 0=least aggressive filter (keeps quiet speech) .. 3=most aggressive.
     # 2 filters more non-speech noise BEFORE it can be hallucinated.
     vad_aggressiveness: int = int(os.getenv("VAD_AGGRESSIVENESS", "2"))
-    silence_ms: int = int(os.getenv("SILENCE_MS", "500"))
+    # Silence before finalizing a segment. v3 default 400ms (was 500):
+    # broadcast turn-taking is FAST — with 500ms a speaker change often lands
+    # inside one segment, which loses the new speaker's opening words to the
+    # previous speaker (and gives the segment a single wrong label).
+    silence_ms: int = int(os.getenv("SILENCE_MS", "400"))
     # Past this length, a monologue is cut at the next micro-gap (live feel).
     # ACCURACY/LATENCY KNOB: longer segments = better transcripts and fewer
     # hallucinations, slower "live" feel. 4000 = snappy; 6000-10000 = quality.
@@ -100,20 +108,33 @@ class Settings:
     # pyannote  -> "Speaker 1..N" by voice, N capped at max_speakers
     # identify  -> enrolled names (voiceprints dir) + Speaker-N fallback
     diarization_mode: str = os.getenv("DIARIZATION_MODE", "pyannote")
+    # SET THIS TO THE EXPECTED SPEAKER COUNT WHEN KNOWN (e.g., 2 for a
+    # two-person interview). v3's ambiguous-zone rule means forced
+    # assignments no longer pollute clusters, so capping is safe and is the
+    # single most effective guard against phantom speakers.
     max_speakers: int = int(os.getenv("MAX_SPEAKERS", "10"))
-    # Cosine DISTANCE between pyannote embeddings; below = same speaker.
-    # 0.45 is a starting point — TUNE IT using the "diarize:" log lines:
-    # same-speaker distances must fall below it, cross-speaker above it.
-    # Too high -> different people merge into one speaker (the "everyone is
-    # Speaker 1" symptom). Too low -> one person splits into many speakers.
+    # MATCH threshold: cosine DISTANCE between pyannote embeddings; below it =
+    # same speaker. TUNE using the "diarize:" log lines: same-speaker
+    # distances must fall below it.
     diarization_threshold: float = float(os.getenv("DIARIZATION_THRESHOLD", "0.45"))
+    # CREATE threshold = match + this margin. Distances in between are
+    # "ambiguous": assigned to the nearest speaker but never stored, never
+    # spawning a new speaker. Raising the margin = fewer phantom speakers,
+    # at the cost of a genuinely new voice needing to be more distinct.
+    diarization_new_speaker_margin: float = float(
+        os.getenv("DIARIZATION_NEW_SPEAKER_MARGIN", "0.15")
+    )
     # A NEW speaker is only created from a segment at least this long;
     # shorter segments are assigned to the nearest existing speaker.
-    min_new_speaker_sec: float = float(os.getenv("MIN_NEW_SPEAKER_SEC", "1.0"))
+    # v3 default 2.0s (was 1.0): one noisy second is not enough evidence to
+    # invent a person.
+    min_new_speaker_sec: float = float(os.getenv("MIN_NEW_SPEAKER_SEC", "2.0"))
     huggingface_token: str = os.getenv("HUGGINGFACE_TOKEN", "")
     if not huggingface_token and diarization_mode in ("pyannote", "identify"):
         raise ValueError(
-            "DIARIZATION_MODE=pyannote or identify requires HUGGINGFACE_TOKEN in .env, and a one-time acceptance of the model conditions at hf.co/pyannote/embedding."
+            "DIARIZATION_MODE=pyannote or identify requires HUGGINGFACE_TOKEN "
+            "in .env, and a one-time acceptance of the model conditions at "
+            "hf.co/pyannote/embedding."
         )
     voiceprints_dir: str = os.getenv("VOICEPRINTS_DIR", "voiceprints")
 
