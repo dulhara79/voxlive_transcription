@@ -1,0 +1,22 @@
+# Core
+fastapi>=0.115
+uvicorn[standard]>=0.30
+numpy>=1.26
+
+# Gemini ASR provider
+google-genai>=1.0
+
+# VAD segmentation (prebuilt wheel — no C++ compiler on Windows/Python 3.13)
+webrtcvad-wheels>=2.0.14
+
+# python-dotenv for .env loading
+python-dotenv>=1.0
+
+# ---- Speaker diarization / identification (pyannote) ----
+# Needed when DIARIZATION_MODE=pyannote or identify.
+# Also requires a Hugging Face token (HUGGINGFACE_TOKEN in .env) and a
+# one-time acceptance of the model conditions at hf.co/pyannote/embedding
+pyannote.audio>=3.1
+torch>=2.2
+torchaudio>=2.2
+omegaconf>=2.1
