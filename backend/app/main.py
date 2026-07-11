@@ -1,5 +1,5 @@
 """
-VoxLive backend — Gemini build + pyannote diarization + paragraph grouping (v2).
+VoxLive backend — Gemini build + pyannote diarization + paragraph grouping (v3).
 
 Pipeline per WebSocket connection (DECOUPLED so audio is never dropped while
 waiting on the Gemini API):
@@ -20,8 +20,8 @@ Run:
 DESIGN NOTES
   - Diarizer is PER-CONNECTION (speaker memory is session-local); the heavy
     pyannote model + voiceprints are shared via caches in diarization.py.
-  - LATENCY: diarization (CPU, 100-400ms) used to run AFTER the Gemini call;
-    v2 launches both concurrently, so diarization is effectively free.
+  - LATENCY: diarization (CPU, 100-400ms) runs concurrently with the Gemini
+    call, so it is effectively free.
   - Timestamps come from the AUDIO CLOCK (bytes / 2 / sample_rate), so they
     reflect when words were spoken, not when Gemini finished.
   - The worker DRAINS the queue if the socket dies (never deadlocks join()).
@@ -90,6 +90,7 @@ def build_diarizer():
             max_speakers=settings.max_speakers,
             hf_token=settings.huggingface_token,
             min_new_speaker_sec=settings.min_new_speaker_sec,
+            new_speaker_margin=settings.diarization_new_speaker_margin,
         )
     if mode in ("pyannote", "cluster"):  # "cluster" kept as an alias
         from .diarization import PyannoteDiarizer
@@ -99,6 +100,7 @@ def build_diarizer():
             max_speakers=settings.max_speakers,
             hf_token=settings.huggingface_token,
             min_new_speaker_sec=settings.min_new_speaker_sec,
+            new_speaker_margin=settings.diarization_new_speaker_margin,
         )
     return Diarizer()
 
@@ -170,6 +172,7 @@ async def health():
         "diarization": settings.diarization_mode,
         "max_speakers": settings.max_speakers,
         "diarization_threshold": settings.diarization_threshold,
+        "diarization_new_speaker_margin": settings.diarization_new_speaker_margin,
         "context_segments": settings.context_segments,
     }
 
