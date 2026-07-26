@@ -1,22 +1,63 @@
-# Core
-fastapi>=0.115
-uvicorn[standard]>=0.30
-numpy>=1.26
+# # ============================================================
+# # VoxLive requirements — v6 (self-correcting diarization)
+# # ============================================================
+# #
+# # v6 adds scipy: the diarizer now uses
+# #   scipy.optimize.linear_sum_assignment  (joint Hungarian speaker matching)
+# #   scipy.cluster.hierarchy + pdist       (periodic global re-clustering)
+# #
+# # Python: pyannote.audio 4.x requires Python 3.10+.
 
-# Gemini ASR provider
-google-genai>=1.0
+# # Core
+# fastapi>=0.115
+# uvicorn[standard]>=0.30
+# numpy>=1.26
+# python-dotenv>=1.0
 
-# VAD segmentation (prebuilt wheel — no C++ compiler on Windows/Python 3.13)
-webrtcvad-wheels>=2.0.14
+# # Gemini ASR provider
+# google-genai>=1.0
 
-# python-dotenv for .env loading
+# # VAD segmentation (prebuilt wheel — no C++ compiler needed on Windows)
+# webrtcvad-wheels>=2.0.14
+
+# # ---- Speaker diarization (pyannote.audio 4.x) ----
+# # Intentional floor at 4.0 (the generation this code targets), open above it
+# # so you keep getting the current stable line and its bugfixes. If a future
+# # 5.x introduces another breaking pipeline change, cap it here explicitly
+# # (>=4.0,<5) until the diarizer is updated for it.
+# pyannote.audio>=4.0
+# torch>=2.2
+# torchaudio>=2.2
+# huggingface_hub>=0.24
+# omegaconf>=2.3
+# scipy>=1.11
+
+# # ============================================================
+# # Confirm your versions after installing:
+# #   pip show pyannote.audio torch torchaudio scipy
+# # Expect pyannote.audio to report 4.x.
+# # ============================================================
+
+# VoxLive v10 backend
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0
 python-dotenv>=1.0
 
-# ---- Speaker diarization / identification (pyannote) ----
-# Needed when DIARIZATION_MODE=pyannote or identify.
-# Also requires a Hugging Face token (HUGGINGFACE_TOKEN in .env) and a
-# one-time acceptance of the model conditions at hf.co/pyannote/embedding
+# ASR
+google-genai>=1.0
+
+# Diarization. NOTE: v10 dropped speaker-diarization-community-1, so the
+# pyannote.audio 4.x requirement is gone -- 3.1 is enough for the embedder.
 pyannote.audio>=3.1
 torch>=2.2
-torchaudio>=2.2
-omegaconf>=2.1
+webrtcvad-wheels>=2.0.14
+
+numpy>=1.26
+scipy>=1.11
+
+# ---- optional: DIARIZATION_BACKEND=sortformer ----
+# Needs a GPU to be worth it. Install separately, not as part of the base set:
+#   pip install Cython packaging
+#   pip install 'git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]'
+# nemo_toolkit[asr]>=2.0
