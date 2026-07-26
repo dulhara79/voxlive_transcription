@@ -1,325 +1,208 @@
 """
-Gemini provider - LLM-based transcription via the batch generateContent API.
+gemini_provider.py — Gemini ASR for Sinhala / Tamil / English, including
+code-switched speech.
 
-WHY THIS EXISTS
-  Whisper (OpenAI) and Google Chirp / si-LK both failed for conversational
-  Sri Lankan speech. Gemini is a multimodal LLM, so it transcribes from
-  semantic context, not pure acoustics - which handles Sinhala+English+Tamil
-  code-switching inside one sentence better than acoustic-only engines.
+LATENCY NOTES (this file is where most of the remaining wall-clock lives)
+------------------------------------------------------------------------
+1. THINKING IS OFF. Flash-tier models reason before answering by default.
+   Transcription has no reasoning in it — the model is reading audio — so a
+   thinking budget is pure added latency. Setting it to 0 typically removes
+   400-900 ms per call. This is the single largest ASR-side win available.
 
-ROLLING CONTEXT (accuracy)
-  A whole-file upload gives Gemini the full conversation as context; our VAD
-  pipeline sends isolated 2-4 s chunks, which is exactly the condition where
-  an LLM transcriber mishears or HALLUCINATES plausible sentences on unclear
-  audio. To recover most of that context advantage, the pipeline passes the
-  last few transcribed segments in `context`, appended to the SYSTEM
-  instruction (never to `contents`, so the no-echo design is preserved).
+2. THE CLIENT IS BUILT ONCE. Constructing a genai.Client per request
+   re-resolves credentials and re-opens the connection pool.
 
-ANTI-HALLUCINATION (layered — Gemini is an assistant, not an ASR engine; on
-noisy/quiet/unclear audio it will happily INVENT fluent speech. No single
-prompt fixes that, so we stack independent guards):
-  1. PROMPT     verbatim-only, "empty over guessing", partial-transcription
-                allowed (so it doesn't fill gaps to make sentences whole),
-                and MULTI-SPEAKER awareness: a clip can contain a speaker
-                change (interview turn-taking) — ALL audible speech must be
-                transcribed, not just the dominant voice. This was a real
-                cause of "missing sentences at speaker changes".
-  2. ECHO GUARD output that parrots the task instruction -> dropped.
-  3. CONTEXT-ECHO GUARD  output that merely repeats/continues the rolling
-                context (a classic LLM failure on near-silent audio) ->
-                dropped. v3: threshold raised 20 -> 35 normalized chars so
-                SHORT conversational echoes (an interviewer repeating the
-                guest's phrase — completely normal speech) are no longer
-                silently deleted from the transcript.
-  4. DENSITY GUARD  real speech is ~2-4 words/sec. If the "transcript" packs
-                > max_words_per_sec into the clip's duration, it was invented
-                -> dropped.
-  Upstream (main.py/config): an RMS energy gate stops silent/hum segments from
-  ever reaching Gemini, and VAD aggressiveness/min-segment length are raised —
-  quiet noise segments are the #1 hallucination trigger.
+3. THE REGION IS PINNED. GOOGLE_CLOUD_LOCATION=global routes each call
+   through Google's global front door, which is fine for throughput and bad
+   for tail latency. From Sri Lanka, asia-south1 (Mumbai) is normally the
+   closest low-latency region; asia-southeast1 (Singapore) is the usual
+   second choice. Measure both — it is a two-line experiment worth doing.
 
-AUTHENTICATION (two modes)
-  1. API key (default):        GEMINI_API_KEY in .env
-  2. Vertex AI service account: GEMINI_USE_VERTEX=true + GOOGLE_CLOUD_PROJECT
-     + GOOGLE_APPLICATION_CREDENTIALS (service account JSON, "Vertex AI User"
-     role, Vertex AI API enabled).
-
-LATENCY
-  gemini-2.5-flash runs "thinking" by default, which adds SECONDS per call for
-  no benefit on transcription. We disable it (thinking_budget=0) and disable
-  automatic function calling. That typically turns 6-9s calls into ~1-2s.
-
-SETUP
-  pip install google-genai
+4. THE RESPONSE IS SCHEMA-CONSTRAINED. Asking for JSON in prose and then
+   parsing it invites preambles and markdown fences; a response schema makes
+   the output shape a decoding constraint instead of a request.
 """
+
+from __future__ import annotations
 
 import asyncio
 import io
 import json
 import logging
-import os
-import re
-import wave
-
-from google import genai
-from google.genai import types
-
-from .base import SpeechProvider, TranscriptResult
+import struct
+from dataclasses import dataclass
+from typing import Optional
 
 log = logging.getLogger("voxlive.gemini")
 
-TARGET_LANGS = ("si", "en", "ta")
-LANG_DISPLAY = {
-    "si": "\u0dc3\u0dd2\u0d82\u0dc4\u0dbd",
-    "en": "English",
-    "ta": "\u0ba4\u0bae\u0bbf\u0bb4\u0bcd",
-}
-
-# Phrases the model might echo from the task instruction. If the "transcript"
-# is exactly one of these, it parroted the prompt -> treat as no speech.
-_ECHO_GUARD = {
-    "transcribe this audio.",
-    "transcribe this audio",
-    "transcribe the audio.",
-    "transcribe the audio",
-}
-
-# Cap how much rolling context we append (chars). Enough for several
-# segments of vocabulary/topic, small enough to keep calls fast and cheap.
-_MAX_CONTEXT_CHARS = 700
-
-# Context-echo guard: minimum normalized length before an output contained in
-# the rolling context is treated as a hallucinated replay. v3 raised this
-# from 20 to 35: real conversations echo short phrases constantly
-# (interviewer repeating the guest's words, "ඔව් ඔව් ඒක තමයි", "exactly,
-# exactly right") and the old cutoff was silently deleting them.
-_CONTEXT_ECHO_MIN_CHARS = 35
-
-SYSTEM_PROMPT = (
-    "You are a strict speech-to-text transcription engine, not an assistant. "
-    "Transcribe ONLY the words that are audibly spoken in THIS audio clip, "
-    "then stop.\n"
-    "Rules:\n"
-    "- Output only the verbatim words actually spoken. Do NOT translate, "
-    "summarize, paraphrase, correct grammar, complete sentences, or clean up "
-    "the speech.\n"
-    "- The clip may contain MORE THAN ONE speaker (e.g., an interview or "
-    "discussion where one person interrupts or replies to another). "
-    "Transcribe ALL audible speech from ALL speakers, in the order it is "
-    "spoken. Never transcribe only the louder or dominant voice and omit "
-    "the other.\n"
-    "- The speakers are Sri Lankan and mix Sinhala, English and Tamil, often "
-    "within one sentence. Keep every word in the language and script it was "
-    "actually spoken in: Sinhala in Sinhala script, English in Latin script, "
-    "Tamil in Tamil script. Never convert one language into another.\n"
-    "- Keep filler words, repetitions and false starts as spoken.\n"
-    "- If only PART of the clip is intelligible, transcribe only that part. "
-    "Never fill gaps with guessed words to make a sentence complete.\n"
-    "- Set 'language' to the DOMINANT language of the segment: si, en, or ta.\n"
-    "- Only if the audio is clearly a language OTHER than Sinhala, English or "
-    "Tamil, return an empty 'text' and language 'other'.\n"
-    "- If there is no intelligible speech (silence, breathing, background "
-    "noise, music, jingles, keyboard sounds), return an empty 'text'. This "
-    "is the CORRECT answer for such audio — never describe the sounds, never "
-    "invent speech for them. Music WITHOUT sung or spoken words is empty "
-    "text, always.\n"
-    "- NEVER guess or invent speech. If the audio is too unclear to transcribe "
-    "confidently, return an empty 'text' rather than a plausible-sounding "
-    "sentence. An omission is acceptable; a fabrication is not.\n"
-    "- Never add commentary, notes, brackets, or explanations."
-)
-
-_CONTEXT_PREFIX = (
-    "\n\nFor context ONLY, here is the most recent transcript of this SAME "
-    "ongoing conversation. Use it ONLY to recognize the topic, names, and "
-    "code-switched vocabulary in the new audio. NEVER repeat, continue, "
-    "complete, or paraphrase this context in your output. If the new audio "
-    "contains no clear speech, return empty text — do NOT reuse words from "
-    "this context. Transcribe ONLY the words actually spoken in the new "
-    "audio:\n"
-)
-
-RESPONSE_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "text": types.Schema(type=types.Type.STRING),
-        "language": types.Schema(
-            type=types.Type.STRING, enum=["si", "en", "ta", "other"]
-        ),
-    },
-    required=["text", "language"],
-)
+LANG_NAMES = {"si": "Sinhala", "ta": "Tamil", "en": "English"}
 
 
-def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
+@dataclass
+class ASRResult:
+    text: str
+    language: str
+
+
+def _wav(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap raw mono int16 PCM in a WAV container.
+
+    Gemini accepts raw PCM, but a container removes any ambiguity about rate
+    and endianness — and a wrong sample rate is silent: the model returns
+    fluent, confident, completely wrong text rather than an error.
+    """
     buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
-    buf.seek(0)
-    return buf.read()
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + len(pcm)))
+    buf.write(b"WAVEfmt ")
+    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16))
+    buf.write(b"data")
+    buf.write(struct.pack("<I", len(pcm)))
+    buf.write(pcm)
+    return buf.getvalue()
 
 
-def _norm(s: str) -> str:
-    """Normalize for fuzzy comparison: strip punctuation/whitespace, lowercase.
-    \\w matches Unicode letters in Python 3, so Sinhala/Tamil are preserved."""
-    return re.sub(r"[\W_]+", "", s, flags=re.UNICODE).lower()
-
-
-class GeminiProvider(SpeechProvider):
+class GeminiProvider:
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str | None = None,
-        allowed_languages: tuple = TARGET_LANGS,
+        api_key: str = "",
+        model: str = "gemini-3.6-flash",
+        allowed_languages: tuple = ("si", "en", "ta"),
         use_vertex: bool = False,
-        project: str | None = None,
-        location: str = "us-central1",
+        project: str = "",
+        location: str = "asia-south1",
         max_words_per_sec: float = 8.0,
+        thinking_budget: int = 0,
     ):
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        self.allowed = (
-            set(allowed_languages) if allowed_languages else set(TARGET_LANGS)
-        )
-        self.max_words_per_sec = max_words_per_sec
+        from google import genai
+
+        self.model = model
+        self.allowed = tuple(allowed_languages)
+        self.max_wps = float(max_words_per_sec)
+        self.thinking_budget = int(thinking_budget)
 
         if use_vertex:
-            # Vertex AI path: authenticates via Application Default Credentials
-            # (GOOGLE_APPLICATION_CREDENTIALS -> service account JSON). No API
-            # key involved; usage is billed to the GCP project.
-            project = project or os.getenv("GOOGLE_CLOUD_PROJECT")
-            if not project:
-                raise ValueError(
-                    "Vertex AI mode requires GOOGLE_CLOUD_PROJECT (and "
-                    "GOOGLE_APPLICATION_CREDENTIALS pointing at the service "
-                    "account JSON)."
+            if location == "global":
+                log.warning(
+                    "GOOGLE_CLOUD_LOCATION=global adds routing latency to every "
+                    "call; pin a region (asia-south1 from Sri Lanka)."
                 )
             self.client = genai.Client(
                 vertexai=True, project=project, location=location
             )
-            auth = f"Vertex AI (project={project}, location={location}, ADC)"
+            log.info("Gemini via Vertex AI (%s, %s)", project, location)
         else:
-            key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-            if not key:
-                raise ValueError(
-                    "GEMINI_API_KEY is not set.\n"
-                    "Create one at https://aistudio.google.com/apikey, or set "
-                    "GEMINI_USE_VERTEX=true to use a service account."
-                )
-            self.client = genai.Client(api_key=key)
-            auth = "API key"
+            self.client = genai.Client(api_key=api_key)
+            log.info("Gemini via API key")
 
-        self._config = self._make_config(None)
-        log.info(
-            "Gemini provider ready (model=%s, auth=%s, thinking disabled)",
-            self.model,
-            auth,
-        )
+        self._system = self._build_system_prompt()
 
-    def _make_config(self, context: str | None) -> "types.GenerateContentConfig":
-        instruction = SYSTEM_PROMPT
-        if context:
-            instruction += _CONTEXT_PREFIX + context[-_MAX_CONTEXT_CHARS:]
-        return types.GenerateContentConfig(
-            system_instruction=instruction,
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA,
-            # Kill latency: no internal "thinking", no function-calling probe.
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True
-            ),
+    def _build_system_prompt(self) -> str:
+        names = ", ".join(LANG_NAMES.get(c, c) for c in self.allowed)
+        return (
+            "You are a verbatim speech transcriber for live Sri Lankan audio.\n"
+            f"The audio contains {names}, and speakers frequently CODE-SWITCH "
+            "mid-sentence.\n"
+            "\n"
+            "RULES\n"
+            "1. Transcribe exactly what is said. Do NOT translate, summarise, "
+            "correct grammar, or complete unfinished sentences.\n"
+            "2. Write each language in its own script: Sinhala in Sinhala "
+            "script, Tamil in Tamil script, English in Latin script. If a "
+            "sentence mixes languages, keep the mix and keep each part in its "
+            "own script — do not romanise Sinhala or Tamil.\n"
+            "3. `language` is the language of the MAJORITY of the words. Use "
+            "exactly one of: " + ", ".join(self.allowed) + ".\n"
+            "4. If the audio is silence, noise, breathing or music, return an "
+            "empty string for `text`. Never invent speech. An empty result is "
+            "always better than a plausible guess.\n"
+            "5. The clip is a fragment of a longer conversation. It may begin "
+            "or end mid-word. Transcribe the fragment as heard; do not pad it.\n"
+            "6. No preamble, no commentary, no speaker labels, no timestamps."
         )
 
     async def transcribe_segment(
-        self, pcm_bytes, sample_rate, context: str | None = None
-    ) -> TranscriptResult:
-        return await asyncio.to_thread(
-            self._transcribe, pcm_bytes, sample_rate, context
-        )
+        self, pcm: bytes, sample_rate: int, context: Optional[str] = None
+    ) -> ASRResult:
+        from google.genai import types
 
-    def _transcribe(
-        self, pcm_bytes: bytes, sample_rate: int, context: str | None = None
-    ) -> TranscriptResult:
-        wav = _pcm_to_wav(pcm_bytes, sample_rate)
-        config = self._make_config(context) if context else self._config
-
-        # Audio only in contents -> nothing for the model to echo as "text".
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=[types.Part.from_bytes(data=wav, mime_type="audio/wav")],
-            config=config,
-        )
-
-        raw = (getattr(response, "text", None) or "").strip()
-        if not raw:
-            return TranscriptResult(text="", language="other", confidence=None)
-
-        text, language = self._parse(raw)
-        if not text:
-            return TranscriptResult(text="", language="other", confidence=None)
-
-        # --- GUARD 2: instruction echo ---
-        if text.lower() in _ECHO_GUARD:
-            log.info("echo guard: model parroted the instruction, dropping")
-            return TranscriptResult(text="", language="other", confidence=None)
-
-        # --- GUARD 3: context echo (hallucination on unclear audio often
-        # just replays/continues the rolling context). Only fires for
-        # NON-TRIVIAL outputs (>= _CONTEXT_ECHO_MIN_CHARS normalized chars):
-        # short conversational echoes — an interviewer repeating a phrase —
-        # are genuine speech and must survive. ---
+        parts = [
+            types.Part.from_bytes(data=_wav(pcm, sample_rate), mime_type="audio/wav")
+        ]
         if context:
-            nt, nc = _norm(text), _norm(context)
-            if len(nt) >= _CONTEXT_ECHO_MIN_CHARS and nt and nt in nc:
-                log.info(
-                    "context-echo guard: output repeats rolling context, "
-                    "dropping: %r",
-                    text[:60],
+            # Rolling context materially improves proper nouns and code-switch
+            # boundaries. It is a HINT, and must be fenced as one, or the model
+            # will happily continue the previous sentence instead of
+            # transcribing the audio.
+            parts.append(
+                types.Part(
+                    text=(
+                        "Context — the immediately preceding transcript, for "
+                        "vocabulary and spelling consistency ONLY. Do not "
+                        "repeat, continue or transcribe it:\n"
+                        f"<<<{context[-1200:]}>>>"
+                    )
                 )
-                return TranscriptResult(text="", language="other", confidence=None)
-
-        # --- GUARD 4: word-density sanity check. Real speech ~2-4 words/sec;
-        # a 2s clip "containing" a 25-word sentence was invented. ---
-        duration = len(pcm_bytes) / 2 / sample_rate
-        if duration > 0:
-            wps = len(text.split()) / duration
-            if wps > self.max_words_per_sec:
-                log.info(
-                    "density guard: %.1f words/sec over %.1fs clip -> "
-                    "hallucination, dropping: %r",
-                    wps,
-                    duration,
-                    text[:60],
-                )
-                return TranscriptResult(text="", language="other", confidence=None)
-
-        if language not in self.allowed:
-            log.info(
-                "dropped non-target language: lang=%s text=%r", language, text[:40]
             )
-            return TranscriptResult(text="", language=language, confidence=None)
 
-        log.info(
-            "lang=%s (%s) text=%r", language, LANG_DISPLAY.get(language, "?"), text[:80]
+        cfg = types.GenerateContentConfig(
+            system_instruction=self._system,
+            temperature=0.0,
+            response_mime_type="application/json",
+            response_schema={
+                "type": "OBJECT",
+                "properties": {
+                    "language": {"type": "STRING", "enum": list(self.allowed)},
+                    "text": {"type": "STRING"},
+                },
+                "required": ["language", "text"],
+            },
         )
-        return TranscriptResult(text=text, language=language, confidence=None)
-
-    @staticmethod
-    def _parse(raw: str):
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            cleaned = cleaned[4:] if cleaned.lower().startswith("json") else cleaned
-            cleaned = cleaned.strip()
+        # Not every model exposes a thinking config; never let that be fatal.
         try:
-            obj = json.loads(cleaned)
-            return (obj.get("text", "") or "").strip(), (
-                obj.get("language") or "other"
-            ).lower()
-        except (json.JSONDecodeError, AttributeError):
-            log.warning("non-JSON response, dropping: %r", raw[:80])
-            return "", "other"
+            cfg.thinking_config = types.ThinkingConfig(
+                thinking_budget=self.thinking_budget
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        resp = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=[types.Content(role="user", parts=parts)],
+            config=cfg,
+        )
+
+        return self._parse(resp, len(pcm) / 2 / sample_rate)
+
+    def _parse(self, resp, duration: float) -> ASRResult:
+        raw = (getattr(resp, "text", "") or "").strip()
+        if not raw:
+            return ASRResult("", self.allowed[0])
+        try:
+            data = json.loads(
+                raw.removeprefix("```json").removeprefix("```").removesuffix("```")
+            )
+        except json.JSONDecodeError:
+            log.warning("non-JSON response: %.120s", raw)
+            return ASRResult("", self.allowed[0])
+
+        text = " ".join(str(data.get("text", "")).split())
+        lang = str(data.get("language", "")).lower()[:2]
+        if lang not in self.allowed:
+            lang = self.allowed[0]
+        if not text:
+            return ASRResult("", lang)
+
+        # Hallucination guard: nobody speaks 8 words a second. A burst well
+        # above human rate means the model looped on noise.
+        words = len(text.split())
+        if duration > 0.4 and words / duration > self.max_wps:
+            log.info(
+                "hallucination guard: %d words in %.1fs (%.1f w/s), dropping",
+                words,
+                duration,
+                words / duration,
+            )
+            return ASRResult("", lang)
+
+        return ASRResult(text, lang)
