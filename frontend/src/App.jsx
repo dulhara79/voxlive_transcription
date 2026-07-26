@@ -32,20 +32,40 @@ const SOURCES = [
   { id: "tab", label: "Tab audio" },
 ];
 
+// Auto is the DEFAULT: the diarizer estimates the speaker count from the audio,
+// so a user who doesn't know how many people are in a recording doesn't have to
+// guess. Setting a number is a CEILING that helps when the count is known —
+// never a requirement.
+const SPEAKER_CHOICES = [0, 2, 3, 4, 5, 6];
+
 export default function App() {
   const [source, setSource] = useState("mic");
+  const [expectedSpeakers, setExpectedSpeakers] = useState(0);
   const [errors, setErrors] = useState([]);
   const endRef = useRef(null);
 
-  // Use the paragraph-based hook instead of segment-based state
-  const { paragraphs, handleMessage, reset } = useTranscript();
+  // Paragraph-based transcript state (upsert by paragraph_id)
+  const {
+    paragraphs,
+    speakers: detectedSpeakers,
+    handleMessage,
+    reset,
+  } = useTranscript();
 
   const onMessage = useCallback(
     (data) => {
-      if (data.type === "transcript" || data.type === "status") {
+      // This allow-list has to include every message useTranscript() can
+      // handle. "refresh" was missing once and the backend's retroactive
+      // speaker correction was computed, sent, and silently discarded —
+      // nothing on screen ever improved. "speakers" is new in v10.
+      if (
+        data.type === "transcript" ||
+        data.type === "status" ||
+        data.type === "refresh" ||
+        data.type === "speakers"
+      ) {
         handleMessage(data);
       } else if (data.type === "error") {
-        // Errors are separate (not paragraphs)
         setErrors((prev) => [...prev, { ...data, _error: true }]);
       }
     },
@@ -71,13 +91,43 @@ export default function App() {
     [paragraphs],
   );
 
-  // FIX: this used to display paragraphs.length as "N speakers" — but
-  // paragraphs are TURNS, not people. A 12-minute two-person interview has
-  // dozens of paragraphs. Count UNIQUE speaker labels instead.
+  // Prefer the server's count: it comes from the clustering itself. Counting
+  // distinct labels on the client over-reports during the window between a
+  // wrong label being rendered and the refresh that corrects it.
   const speakerCount = useMemo(
-    () => new Set(paragraphs.map((p) => p.speaker)).size,
-    [paragraphs],
+    () => detectedSpeakers || new Set(paragraphs.map((p) => p.speaker)).size,
+    [detectedSpeakers, paragraphs],
   );
+
+  // ---- unsaved-work tracking -------------------------------------------
+  // A transcript exists only in this tab until it is downloaded, so a reload,
+  // a closed tab, or starting a second recording destroys it permanently. The
+  // signature is the transcript's content, not a boolean flag: downloading and
+  // then speaking again correctly counts as unsaved once more.
+  const signature = useMemo(
+    () => `${paragraphs.length}:${wordCount}`,
+    [paragraphs.length, wordCount],
+  );
+  const [savedSignature, setSavedSignature] = useState("");
+  const [confirming, setConfirming] = useState(null); // null | "new"
+
+  const hasUnsaved =
+    recording || (paragraphs.length > 0 && signature !== savedSignature);
+
+  useEffect(() => {
+    if (!hasUnsaved) return;
+    const warn = (e) => {
+      // Browsers ignore custom text and show their own wording, but they only
+      // prompt at all if the handler both preventDefault()s and sets
+      // returnValue. Chrome additionally requires a prior interaction with the
+      // page, which pressing Start already satisfies.
+      e.preventDefault();
+      e.returnValue = "";
+      return "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [hasUnsaved]);
 
   // ---- transcript download (.txt) ----
   // The leading \uFEFF is a UTF-8 BOM: without it, Windows Notepad can
@@ -106,12 +156,37 @@ export default function App() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  }, [paragraphs, wordCount, speakerCount]);
+    setSavedSignature(signature);
+  }, [paragraphs, wordCount, speakerCount, signature]);
 
-  const handleNewSession = useCallback(() => {
+  const beginSession = useCallback(() => {
     reset();
     setErrors([]);
-  }, [reset]);
+    setSavedSignature("");
+    setConfirming(null);
+    start(source, expectedSpeakers);
+  }, [reset, start, source, expectedSpeakers]);
+
+  const onPrimaryClick = useCallback(() => {
+    if (recording) {
+      stop();
+      return;
+    }
+    // Starting over wipes the previous transcript. Ask first, and offer the
+    // download rather than just blocking the action.
+    if (paragraphs.length > 0 && signature !== savedSignature) {
+      setConfirming("new");
+      return;
+    }
+    beginSession();
+  }, [
+    recording,
+    stop,
+    paragraphs.length,
+    signature,
+    savedSignature,
+    beginSession,
+  ]);
 
   return (
     <div className="flex h-full flex-col bg-neutral-50 text-neutral-900">
@@ -144,11 +219,9 @@ export default function App() {
             <EmptyState recording={recording} source={source} />
           ) : (
             <div className="space-y-4">
-              {/* Errors first */}
               {errors.map((e, i) => (
                 <ErrorRow key={`err-${i}`} seg={e} />
               ))}
-              {/* Then transcript paragraphs */}
               <TranscriptView paragraphs={paragraphs} />
             </div>
           )}
@@ -158,10 +231,15 @@ export default function App() {
 
       <footer className="border-t border-neutral-200 bg-white px-6 py-4">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
             <SourceToggle
               source={source}
               setSource={setSource}
+              disabled={recording}
+            />
+            <SpeakerSelect
+              speakers={expectedSpeakers}
+              setSpeakers={setExpectedSpeakers}
               disabled={recording}
             />
             <span className="hidden text-xs text-neutral-400 sm:block">
@@ -171,6 +249,15 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center gap-3">
+            {paragraphs.length > 0 && signature !== savedSignature && (
+              <span
+                className="flex items-center gap-1.5 text-xs text-amber-700"
+                title="This transcript only exists in this tab until you download it"
+              >
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                Not downloaded
+              </span>
+            )}
             <button
               onClick={downloadTxt}
               disabled={paragraphs.length === 0}
@@ -179,14 +266,7 @@ export default function App() {
               Download .txt
             </button>
             <button
-              onClick={() => {
-                if (recording) {
-                  stop();
-                } else {
-                  handleNewSession();
-                  start(source);
-                }
-              }}
+              onClick={onPrimaryClick}
               className={
                 "rounded-full px-6 py-2.5 text-sm font-medium transition-colors " +
                 (recording
@@ -199,7 +279,103 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {confirming === "new" && (
+        <ConfirmDiscard
+          turns={paragraphs.length}
+          words={wordCount}
+          onDownload={() => {
+            downloadTxt();
+            beginSession();
+          }}
+          onDiscard={beginSession}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
     </div>
+  );
+}
+
+function ConfirmDiscard({ turns, words, onDownload, onDiscard, onCancel }) {
+  // Escape cancels, and focus lands on the safe action — the destructive one
+  // should never be a stray Enter away.
+  const safeRef = useRef(null);
+  useEffect(() => {
+    safeRef.current?.focus();
+    const onKey = (e) => e.key === "Escape" && onCancel();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/40 px-6"
+      onClick={onCancel}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="discard-title"
+        className="w-full max-w-md rounded-xl border border-neutral-200 bg-white p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="discard-title" className="text-base font-semibold">
+          Start a new recording?
+        </h2>
+        <p className="mt-2 text-sm text-neutral-600">
+          The current transcript — {turns} turn{turns !== 1 ? "s" : ""}, {words}{" "}
+          word{words !== 1 ? "s" : ""} — hasn't been downloaded. Starting a new
+          recording clears it, and it can't be recovered.
+        </p>
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
+          <button
+            ref={safeRef}
+            onClick={onCancel}
+            className="rounded-full border border-neutral-300 bg-white px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100"
+          >
+            Keep transcript
+          </button>
+          <button
+            onClick={onDownload}
+            className="rounded-full bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800"
+          >
+            Download, then start
+          </button>
+          <button
+            onClick={onDiscard}
+            className="rounded-full border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50"
+          >
+            Discard and start
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SpeakerSelect({ speakers, setSpeakers, disabled }) {
+  return (
+    <label
+      className={
+        "flex items-center gap-1.5 text-xs text-neutral-500 " +
+        (disabled ? "opacity-50" : "")
+      }
+      title="Auto estimates the speaker count from the audio. Choosing a number sets a CEILING, not a quota: set it to 2 and a monologue still stays one speaker."
+    >
+      <span className="hidden sm:inline">Speakers</span>
+      <select
+        value={speakers}
+        disabled={disabled}
+        onChange={(e) => setSpeakers(Number(e.target.value))}
+        className="rounded-full border border-neutral-300 bg-white px-2.5 py-1.5 text-xs font-medium text-neutral-700 disabled:cursor-not-allowed"
+      >
+        {SPEAKER_CHOICES.map((n) => (
+          <option key={n} value={n}>
+            {n === 0 ? "Auto" : n}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
