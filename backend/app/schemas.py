@@ -4,31 +4,47 @@ WebSocket message contract (server -> client).
 status:      {type:"status", state:"ready|transcribing|stopped"}
 transcript:  {type:"transcript", paragraph_id, segment_id, speaker, language,
               text, start, end, final}
+refresh:     {type:"refresh", paragraphs:[<transcript messages>]}
+speakers:    {type:"speakers", count:int}
 error:       {type:"error", segment_id, message}
 
-PARAGRAPH GROUPING
-  Consecutive segments from the SAME speaker share one paragraph_id, and each
-  message carries the FULL accumulated paragraph text so far (not just the new
-  segment). The frontend must therefore UPSERT by paragraph_id:
+PARAGRAPH IDENTITY (v10 — changed, read this)
+  paragraph_id is the chunk_id of the paragraph's FIRST chunk. It is assigned
+  in audio order before transcription and never renumbered.
 
-      // React sketch — paragraphs is an ordered map keyed by paragraph_id
-      onMessage(msg) {
-        if (msg.type !== "transcript") return;
-        setParagraphs(prev => ({ ...prev, [msg.paragraph_id]: msg }));
-      }
-      // render: Object.values(paragraphs)
-      //           .sort((a, b) => a.paragraph_id - b.paragraph_id)
-      //           .map(p => <p key={p.paragraph_id}>
-      //                       <b>{p.speaker}:</b> {p.text}
-      //                     </p>)
+  v7 numbered paragraphs by position in the list, which meant an out-of-order
+  ASR completion silently shifted every id after it and the client's upsert
+  landed in the wrong slot. If you are porting a client, the important
+  consequence is that ids are now STABLE but NOT CONTIGUOUS — do not assume
+  1,2,3. Sort by `start`, not by paragraph_id.
 
-  Result: "Speaker 1: <everything they said in that turn as one paragraph>",
-  then a new paragraph when the speaker changes.
+REFRESH
+  Speaker labels are attached to text by timestamp, and the diarizer re-derives
+  the whole session's timeline every pass. Whenever that changes the shape of
+  the transcript — a speaker corrected, two paragraphs merging because they
+  turned out to be the same person, a late chunk landing mid-transcript — the
+  server sends the complete corrected list. The client must REPLACE its
+  paragraph map with refresh.paragraphs, not merge into it.
+
+  A plain `transcript` message is only sent when exactly one paragraph changed
+  and it is the last one. Everything else is a refresh.
 """
 
 
 def status_msg(state: str) -> dict:
     return {"type": "status", "state": state}
+
+
+def refresh_msg(paragraphs: list) -> dict:
+    return {"type": "refresh", "paragraphs": paragraphs}
+
+
+def speakers_msg(count: int) -> dict:
+    return {"type": "speakers", "count": count}
+
+
+def error_msg(message: str, segment_id: int | None = None) -> dict:
+    return {"type": "error", "segment_id": segment_id, "message": message}
 
 
 def transcript_msg(

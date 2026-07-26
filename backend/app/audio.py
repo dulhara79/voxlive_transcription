@@ -1,32 +1,40 @@
 """
 Streaming VAD segmenter.
 
-Consumes raw 16kHz mono int16 PCM (as bytes) and yields finalized speech
-segments. This is what makes a batch model usable in "real time": we cut the
-audio at natural pauses and transcribe one utterance at a time.
+Consumes raw 16 kHz mono int16 PCM and yields finalized speech segments with
+EXACT absolute timing.
 
-webrtcvad works on 10/20/30 ms frames of 16-bit mono PCM. We use 30 ms.
+WHAT CHANGED IN v10
+-------------------
+v7 returned bare `bytes` and main.py reconstructed the timing:
 
-SEGMENT-END RULES (first one to fire wins):
+    seg_start = max(0.0, end_time - duration)      # end_time = bytes_seen/2/sr
+
+That is wrong by however much audio is sitting in the segmenter's internal
+frame buffer, and it drifts further because pre-roll padding prepends frames
+from *before* the segment. A few tens of milliseconds does not matter for
+display, but it matters a lot now that speaker labels are joined to text by
+timestamp overlap: a segment nudged 200 ms late can borrow the label of the
+turn after it.
+
+The segmenter knows exactly how many frames it has consumed, so it now reports
+(pcm, start, end) itself and there is only one clock in the system.
+
+SEGMENT-END RULES (first to fire wins):
   1. silence   -> `silence_ms` of trailing silence (normal end of a turn).
-  2. soft gap  -> once a segment passes `soft_max_segment_ms`, end it at the
-                  NEXT micro-gap between words. This keeps a non-stop speaker
-                  (online meeting, lecture) flowing in short, clean lines
-                  instead of one slab, WITHOUT slicing through a word.
-  3. hard max  -> `max_segment_ms` absolute ceiling. Only hit if someone truly
-                  never pauses; this is the one cut that may land mid-word, so
-                  it's a last resort, set generously.
+  2. soft gap  -> past `soft_max_segment_ms`, end at the NEXT micro-gap. Keeps
+                  a non-stop speaker flowing in short lines without slicing a
+                  word.
+  3. hard max  -> `max_segment_ms` ceiling; may land mid-word, so set it
+                  generously.
 
-ACCURACY - pre-roll padding:
-  The VAD only TRIGGERS on a frame loud enough to count as speech, so the soft
-  onset of a word gets dropped. We keep a small ring buffer of recent pre-speech
-  frames and prepend them on trigger so word onsets aren't clipped.
-
-NOTE on sample rate: webrtcvad ONLY accepts 8000/16000/32000/48000 Hz. The
-frontend resamples to exactly 16000 in the AudioWorklet, so this is 16000.
+webrtcvad only accepts 8000/16000/32000/48000 Hz; the AudioWorklet resamples
+to exactly 16000.
 """
+
 import logging
 from collections import deque
+from dataclasses import dataclass
 
 import webrtcvad
 
@@ -35,17 +43,29 @@ log = logging.getLogger("voxlive.vad")
 _VALID_RATES = (8000, 16000, 32000, 48000)
 
 
+@dataclass
+class Segment:
+    pcm: bytes
+    start: float  # absolute session seconds
+    end: float
+    reason: str  # silence | soft_gap | max_len | flush
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
 class VADSegmenter:
     def __init__(
         self,
         sample_rate: int = 16000,
         frame_ms: int = 30,
         vad_aggressiveness: int = 2,
-        silence_ms: int = 500,
-        max_segment_ms: int = 8000,
+        silence_ms: int = 320,
+        max_segment_ms: int = 9000,
         min_segment_ms: int = 300,
         pre_roll_ms: int = 250,
-        soft_max_segment_ms: int = 4000,
+        soft_max_segment_ms: int = 3500,
     ):
         if frame_ms not in (10, 20, 30):
             raise ValueError("frame_ms must be 10, 20 or 30 (webrtcvad limitation)")
@@ -57,12 +77,14 @@ class VADSegmenter:
 
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
-        self.frame_bytes = int(sample_rate * frame_ms / 1000) * 2  # int16 = 2 bytes
+        self.frame_sec = frame_ms / 1000.0
+        self.frame_bytes = int(sample_rate * frame_ms / 1000) * 2
         self.vad = webrtcvad.Vad(vad_aggressiveness)
         self.silence_frames = max(1, silence_ms // frame_ms)
         self.max_frames = max(1, max_segment_ms // frame_ms)
-        # soft cap must sit below the hard ceiling to be useful
-        self.soft_max_frames = min(max(1, soft_max_segment_ms // frame_ms), self.max_frames)
+        self.soft_max_frames = min(
+            max(1, soft_max_segment_ms // frame_ms), self.max_frames
+        )
         self.min_bytes = int(sample_rate * min_segment_ms / 1000) * 2
 
         self.pre_roll_frames = max(0, pre_roll_ms // frame_ms)
@@ -75,21 +97,34 @@ class VADSegmenter:
         self._triggered = False
         self._silence_run = 0
         self._frames_in_seg = 0
+        self._frames_consumed = 0  # THE clock: frames read off the wire
+        self._seg_start_frame = 0
 
         log.info(
             "VADSegmenter ready: rate=%d frame=%dms aggr=%d silence=%dms "
             "soft_max=%dms max=%dms min=%dms preroll=%dms",
-            sample_rate, frame_ms, vad_aggressiveness, silence_ms,
-            soft_max_segment_ms, max_segment_ms, min_segment_ms, pre_roll_ms,
+            sample_rate,
+            frame_ms,
+            vad_aggressiveness,
+            silence_ms,
+            soft_max_segment_ms,
+            max_segment_ms,
+            min_segment_ms,
+            pre_roll_ms,
         )
 
-    def add_audio(self, pcm_bytes: bytes) -> list[bytes]:
-        """Feed raw PCM. Returns a list of finalized segments (may be empty)."""
-        finalized: list[bytes] = []
+    @property
+    def now(self) -> float:
+        """Absolute session seconds consumed so far."""
+        return self._frames_consumed * self.frame_sec
+
+    def add_audio(self, pcm_bytes: bytes) -> list[Segment]:
+        finalized: list[Segment] = []
         self._inbuf.extend(pcm_bytes)
         while len(self._inbuf) >= self.frame_bytes:
             frame = bytes(self._inbuf[: self.frame_bytes])
             del self._inbuf[: self.frame_bytes]
+            self._frames_consumed += 1
             seg = self._process_frame(frame)
             if seg is not None:
                 finalized.append(seg)
@@ -103,10 +138,15 @@ class VADSegmenter:
                 self._triggered = True
                 self._seg = bytearray()
                 self._frames_in_seg = 0
+                # The segment starts at the FIRST pre-roll frame, not at the
+                # frame that tripped the VAD — otherwise every start timestamp
+                # is late by the pre-roll length.
+                pre = len(self._preroll) if self._preroll else 0
+                self._seg_start_frame = self._frames_consumed - 1 - pre
                 if self._preroll:
                     for f in self._preroll:
                         self._seg.extend(f)
-                    self._frames_in_seg = len(self._preroll)
+                    self._frames_in_seg = pre
                     self._preroll.clear()
                 self._seg.extend(frame)
                 self._frames_in_seg += 1
@@ -115,25 +155,28 @@ class VADSegmenter:
                 self._preroll.append(frame)
             return None
 
-        # inside a speech run
         self._seg.extend(frame)
         self._frames_in_seg += 1
         self._silence_run = 0 if is_speech else self._silence_run + 1
 
         hit_silence = self._silence_run >= self.silence_frames
-        # past the soft cap, end at the first micro-gap (a single non-speech
-        # frame) so long monologues are chopped into clean near-real-time lines.
         soft_cut = self._frames_in_seg >= self.soft_max_frames and not is_speech
-        hit_max = self._frames_in_seg >= self.max_frames  # may cut mid-word
+        hit_max = self._frames_in_seg >= self.max_frames
 
         if hit_silence or soft_cut or hit_max:
-            seg = bytes(self._seg)
-            reason = "silence" if hit_silence else ("soft_gap" if soft_cut else "max_len")
+            pcm = bytes(self._seg)
+            reason = (
+                "silence" if hit_silence else ("soft_gap" if soft_cut else "max_len")
+            )
+            start = self._seg_start_frame * self.frame_sec
+            end = self._frames_consumed * self.frame_sec
             self._reset_segment()
-            if len(seg) >= self.min_bytes:
-                log.debug("segment finalized (%s): %d bytes", reason, len(seg))
-                return seg
-            log.debug("segment dropped (<min, %s): %d bytes", reason, len(seg))
+            if len(pcm) >= self.min_bytes:
+                log.debug(
+                    "segment %.2f-%.2fs (%s, %d bytes)", start, end, reason, len(pcm)
+                )
+                return Segment(pcm, max(0.0, start), end, reason)
+            log.debug("segment dropped (<min, %s): %d bytes", reason, len(pcm))
             return None
         return None
 
@@ -145,6 +188,12 @@ class VADSegmenter:
 
     def flush(self):
         """Force-finalize whatever speech is buffered (call on stop)."""
-        seg = bytes(self._seg) if self._triggered else b""
+        if not self._triggered:
+            return None
+        pcm = bytes(self._seg)
+        start = self._seg_start_frame * self.frame_sec
+        end = self._frames_consumed * self.frame_sec
         self._reset_segment()
-        return seg if len(seg) >= self.min_bytes else None
+        if len(pcm) < self.min_bytes:
+            return None
+        return Segment(pcm, max(0.0, start), end, "flush")
