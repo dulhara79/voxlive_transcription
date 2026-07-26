@@ -7,19 +7,18 @@ import { useCallback, useRef, useState } from "react";
 //   "tab"  — a browser tab's audio via getDisplayMedia. For transcribing
 //            PLAYED audio (YouTube news clips, recordings): the audio is
 //            captured DIGITALLY, so speaker volume, room reverb and mic
-//            quality don't exist in the path. This is the apples-to-apples
-//            equivalent of uploading the file to Gemini on the web —
-//            playing audio out of speakers into a laptop mic is an acoustic
-//            re-recording and will always transcribe worse.
+//            quality don't exist in the path.
+//
+// v4: start(source, speakers) — `speakers` is the KNOWN speaker count for
+// this session (0 = auto). It's sent as ?speakers=N on the WebSocket URL and
+// hard-caps diarization identities on the backend: with speakers=2, phantom
+// "Speaker 7" labels are impossible.
 //
 // An AudioWorklet resamples whatever rate the context actually runs at down
 // to exactly 16 kHz (browsers often ignore the requested rate).
 //
 // STOP HANDSHAKE: the server finishes transcribing every queued segment
 // before replying {status:"stopped"}; we keep the socket open until then.
-//
-// LEVEL METER: `level` exposes the input RMS (0..1) so "no audio is arriving"
-// is visible at a glance.
 const TARGET_SAMPLE_RATE = 16000;
 const STOP_FLUSH_TIMEOUT_MS = 20000;
 const LEVEL_UPDATE_MS = 100;
@@ -37,12 +36,17 @@ export function useAudioStream(wsUrl, onMessage) {
   const stopRef = useRef(null); // so async callbacks can trigger stop()
 
   const start = useCallback(
-    async (source = "mic") => {
+    async (source = "mic", speakers = 0) => {
       setStatus("connecting");
 
       try {
-        // 1) open the socket first
-        const ws = new WebSocket(wsUrl);
+        // 1) open the socket first. speakers>0 = the user KNOWS the count;
+        // the backend caps diarization identities to exactly that many.
+        const url =
+          speakers > 0
+            ? `${wsUrl}?speakers=${encodeURIComponent(speakers)}`
+            : wsUrl;
+        const ws = new WebSocket(url);
         ws.binaryType = "arraybuffer";
         wsRef.current = ws;
         ws.onmessage = (e) => {
@@ -97,9 +101,7 @@ export function useAudioStream(wsUrl, onMessage) {
           stream = disp;
         } else {
           // Microphone. echoCancellation/noiseSuppression/autoGainControl are
-          // tuned for phone-call cleanup and HURT transcription fidelity —
-          // echoCancellation in particular subtracts speaker playback, i.e.
-          // exactly the audio you want when testing with a played file.
+          // tuned for phone-call cleanup and HURT transcription fidelity.
           stream = await navigator.mediaDevices.getUserMedia({
             audio: {
               channelCount: 1,
@@ -117,7 +119,8 @@ export function useAudioStream(wsUrl, onMessage) {
         ctxRef.current = ctx;
 
         console.log(
-          `[VoxLive] source=${source} AudioContext sampleRate = ${ctx.sampleRate}` +
+          `[VoxLive] source=${source} speakers=${speakers || "auto"} ` +
+            `AudioContext sampleRate = ${ctx.sampleRate}` +
             (ctx.sampleRate === TARGET_SAMPLE_RATE
               ? " (honored, passthrough)"
               : ` (NOT honored → worklet resampling ${ctx.sampleRate}→${TARGET_SAMPLE_RATE})`),
