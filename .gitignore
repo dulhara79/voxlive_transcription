@@ -24,6 +24,7 @@ desktop.ini
 *.swo
 
 # --- Environment and Secret Files ---
+C:\Users\dulha\Downloads\GitHub\voxlive-gemini\backend\.env
 .env.*
 !.env.example
 
@@ -157,3 +158,4 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+backend/.env

@@ -8,7 +8,7 @@ the wrong slot and stale content stayed on screen.
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.transcript import TranscriptStore
+from app.session.transcript import TranscriptStore
 
 
 # ---------------------------------------------------------------- v7 baseline

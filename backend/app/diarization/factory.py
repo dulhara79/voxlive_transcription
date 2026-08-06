@@ -74,7 +74,7 @@ def build_diarizer(settings, expected_speakers: int):
     backend = resolve_backend(getattr(settings, "diarization_backend", "embedding"))
 
     if backend == "sortformer":
-        from .diarizer_sortformer import SortformerDiarizer
+        from .sortformer import SortformerDiarizer
 
         return SortformerDiarizer(
             sample_rate=settings.sample_rate,
@@ -84,7 +84,7 @@ def build_diarizer(settings, expected_speakers: int):
             enabled=settings.diarization_enabled,
         )
 
-    from .diarization_service import DiarizationService
+    from .service import DiarizationService
 
     return DiarizationService(
         hf_token=settings.huggingface_token,
@@ -107,7 +107,7 @@ async def warmup_backend(settings) -> None:
 
     backend = resolve_backend(getattr(settings, "diarization_backend", "embedding"))
     if backend == "sortformer":
-        from .diarizer_sortformer import warmup
+        from .sortformer import warmup
 
         await asyncio.to_thread(warmup)
         log.info("Diarization: Sortformer streaming (warm)")

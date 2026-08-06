@@ -26,8 +26,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.config import settings  # noqa: E402
-from app.embedder import Embedder, warmup  # noqa: E402
-from app.speaker_engine import (  # noqa: E402
+from app.diarization.embedder import Embedder, warmup  # noqa: E402
+from app.diarization.speaker_engine import (  # noqa: E402
     SpeakerEngine,
     Window,
     slice_windows,

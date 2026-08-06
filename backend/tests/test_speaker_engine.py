@@ -10,7 +10,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 
-from app.speaker_engine import SpeakerEngine, Window, l2norm
+from app.diarization.speaker_engine import (
+    SpeakerEngine,
+    Window,
+    l2norm,
+    TRUST_SEC,
+    WIN_SEC,
+)
 
 RNG = np.random.default_rng(7)
 DIM = 256
@@ -35,7 +41,11 @@ def utterance(base: np.ndarray, jitter: float = 0.75) -> np.ndarray:
     return l2norm(base + jitter * l2norm(RNG.normal(size=DIM)))
 
 
-def build(turns, win_sec=1.5, hop=0.75):
+def build(turns, win_sec=WIN_SEC, hop=0.75):
+    assert win_sec >= TRUST_SEC, (
+        f"test windows ({win_sec}s) below TRUST_SEC ({TRUST_SEC}s) — "
+        "every window would be untrusted and the test would pass vacuously"
+    )
     """turns: [(speaker_base, n_windows)] laid out consecutively in time."""
     wins, truth, t = [], [], 0.0
     for base, n in turns:

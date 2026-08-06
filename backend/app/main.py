@@ -43,12 +43,12 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .audio import Segment, VADSegmenter
+from .audio.vad import Segment, VADSegmenter
 from .config import settings
-from .diarizer_factory import build_diarizer, resolve_backend, warmup_backend
-from .postprocess import PostProcessor
-from .schemas import error_msg, refresh_msg, speakers_msg, status_msg
-from .transcript import TranscriptStore
+from .diarization.factory import build_diarizer, resolve_backend, warmup_backend
+from .asr.postprocess import PostProcessor
+from .api.schemas import error_msg, refresh_msg, speakers_msg, status_msg
+from .session.transcript import TranscriptStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,7 +79,7 @@ def _is_rate_limit(err) -> bool:
 
 
 def build_provider():
-    from .providers.gemini_provider import GeminiProvider
+    from .asr.gemini_provider import GeminiProvider
 
     log.info("ASR provider: Gemini (%s)", settings.gemini_model)
     return GeminiProvider(
