@@ -36,6 +36,7 @@ from typing import Any, Optional
 
 from fastapi import WebSocket
 
+from ..asr.scheduler import ASRScheduler
 from .state import SessionState, new_session_id
 
 log = logging.getLogger("voxlive.sessions")
@@ -60,7 +61,7 @@ class SessionManager:
         self,
         ws: WebSocket,
         expected_speakers: int,
-        provider: Any,
+        asr_scheduler: ASRScheduler,
         postproc: Any,
         session_id: Optional[str] = None,
     ) -> SessionState:
@@ -72,7 +73,7 @@ class SessionManager:
             ws=ws,
             session_id=sid,
             expected_speakers=expected_speakers,
-            provider=provider,
+            asr_scheduler=asr_scheduler,
             postproc=postproc,
         )
         async with self._lock:

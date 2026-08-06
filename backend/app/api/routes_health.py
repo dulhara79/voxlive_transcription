@@ -55,6 +55,26 @@ async def health(request: Request) -> dict:
     }
 
 
+@router.get("/metrics")
+async def metrics(request: Request) -> dict:
+    """Scheduler and session counters.
+
+    These are the autoscaling signals CPU alone would miss: CPU can sit at 45%
+    while `asr.queue_depth` is 200 and P95 latency is six seconds. The
+    CloudWatch commit publishes these; for now they are readable by hand and
+    scrapeable by the load-test harness.
+    """
+    st = request.app.state
+    sessions = getattr(st, "sessions", None)
+    asr = getattr(st, "asr_scheduler", None)
+    diar = getattr(st, "diar_scheduler", None)
+    return {
+        "active_sessions": sessions.count() if sessions is not None else 0,
+        "asr": asr.snapshot() if asr is not None else {},
+        "diarization": diar.snapshot() if diar is not None else {},
+    }
+
+
 @router.get("/ready")
 async def ready(request: Request, response: Response) -> dict:
     """Readiness gate for ECS/ALB. 503 until warm-up has completed."""

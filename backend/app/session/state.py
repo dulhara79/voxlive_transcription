@@ -13,25 +13,21 @@ It deliberately knows NOTHING about AWS, RDS, Redis, ECS or Cognito. It does
 not know how many other sessions exist (that is SessionManager's job) and it
 does not know how the browser is addressed (that is routes_ws.py's job).
 
-WHAT DELIBERATELY DID *NOT* CHANGE
-----------------------------------
-This commit is a responsibility split, not a behaviour change. The acceptance
-test is that the refactored branch behaves identically to the frozen
-`v1-demo-baseline` demo. So two known production problems are preserved here
-EXACTLY as they were, and are fixed in the NEXT commit:
+CAPACITY IS NOT DECIDED HERE ANY MORE
+-------------------------------------
+The baseline gave every session its own `Semaphore(6)`, so total ASR pressure
+was a per-session opinion multiplied by however many browsers connected. Both
+of those gaps are now closed:
 
-  1. `self.asr_slots` is still a PER-SESSION semaphore. 500 sessions x 6 =
-     up to 3,000 concurrent ASR calls. This becomes a single process-wide
-     ASRScheduler in `app/asr/scheduler.py`.
+  * ASR concurrency belongs to the process-wide `ASRScheduler`. This class
+    only submits work to it. `MAX_INFLIGHT_PER_SESSION` remains, but it is a
+    FAIRNESS limit — it stops one session monopolising the shared queue — not
+    a capacity limit.
 
-  2. `self.queue` is still an unbounded `asyncio.Queue()`. The number of
-     in-flight TASKS is bounded (`ASR_CONCURRENCY * 2`), but the waiting
-     backlog is not. This gains a `maxsize` and an explicit overflow policy
-     in the same commit as the scheduler.
-
-Both are marked `PRODUCTION-GAP` below. Do not fix them here — fixing them in
-this commit would make it impossible to tell whether a behaviour change came
-from the restructure or from the concurrency work.
+  * The segment queue is bounded (`SEGMENT_QUEUE_MAXSIZE`) with an explicit
+    overflow policy: drop the oldest waiting segment. Under overload the
+    transcript now falls behind and recovers, instead of growing a backlog
+    that never drains.
 
 THE PIPELINE THIS OWNS
 ----------------------
@@ -56,6 +52,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..api.schemas import error_msg, refresh_msg, speakers_msg, status_msg
+from ..asr.scheduler import ASRQueueFull, ASRScheduler
 from ..audio.vad import Segment, VADSegmenter
 from ..config import settings
 from ..diarization.factory import build_diarizer
@@ -63,12 +60,18 @@ from .transcript import TranscriptStore
 
 log = logging.getLogger("voxlive.session")
 
-ASR_MAX_RETRIES = 3
+# How many segment tasks one session may have in flight. This is a FAIRNESS
+# limit, not a capacity limit: total ASR pressure is now the scheduler's job,
+# and this only stops one very talkative session from filling the shared queue
+# with its own backlog.
+MAX_INFLIGHT_PER_SESSION = int(os.getenv("MAX_INFLIGHT_PER_SESSION", "12"))
 
-# PRODUCTION-GAP (1 of 2): per-session ASR ceiling. Moves into a single
-# process-wide ASRScheduler in the next commit; kept here, with the same env
-# var and the same default, so this commit changes no behaviour.
-ASR_CONCURRENCY = int(os.getenv("ASR_CONCURRENCY", "6"))
+# Bounded per-session audio backlog. The baseline used an unbounded
+# asyncio.Queue(): if processing fell behind, segments accumulated with no
+# ceiling and one slow session could exhaust process memory. Overflow now
+# drops the OLDEST waiting segment, because in live transcription stale audio
+# is the least valuable thing in the queue.
+SEGMENT_QUEUE_MAXSIZE = int(os.getenv("SEGMENT_QUEUE_MAXSIZE", "32"))
 
 # Padding around a speaker-turn cut so word onsets/offsets aren't clipped.
 CHUNK_PAD_PRE_S = 0.10
@@ -113,7 +116,7 @@ class SessionState:
         ws: WebSocket,
         session_id: str,
         expected_speakers: int,
-        provider: Any,
+        asr_scheduler: ASRScheduler,
         postproc: Any,
     ):
         # ---- identity -----------------------------------------------------
@@ -125,7 +128,6 @@ class SessionState:
 
         # ---- collaborators (injected, never reached for globally) ---------
         self.ws = ws
-        self.provider = provider
         self.postproc = postproc
 
         # ---- pipeline -----------------------------------------------------
@@ -148,10 +150,9 @@ class SessionState:
         )
 
         # ---- concurrency --------------------------------------------------
-        # PRODUCTION-GAP (1 of 2): see module docstring.
-        self.asr_slots = asyncio.Semaphore(ASR_CONCURRENCY)
-        # PRODUCTION-GAP (2 of 2): no maxsize. Bounded in the scheduler commit.
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.asr = asr_scheduler
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=SEGMENT_QUEUE_MAXSIZE)
+        self.dropped_segments = 0
         self.emit_lock = asyncio.Lock()  # serialises store mutation + sends
         self.inflight: set[asyncio.Task] = set()
         self._worker_task: Optional[asyncio.Task] = None
@@ -205,6 +206,7 @@ class SessionState:
             "segments": self.seg_id,
             "inflight": len(self.inflight),
             "queue_depth": self.queue.qsize(),
+            "dropped_segments": self.dropped_segments,
             "speakers": self.last_speaker_count,
             "sequence": self.sequence,
         }
@@ -256,7 +258,7 @@ class SessionState:
         self.diar.feed(pcm)
         for segment in self.seg.add_audio(pcm):
             self.seg_id += 1
-            self.queue.put_nowait((self.seg_id, segment))
+            self._enqueue(self.seg_id, segment)
 
         if self.seg.now - self._last_beat >= 10.0:
             self._last_beat = self.seg.now
@@ -268,6 +270,36 @@ class SessionState:
                 extra={"session_id": self.session_id},
             )
 
+    def _enqueue(self, seg_id: int, segment: Segment) -> None:
+        """Queue a segment, dropping the OLDEST if the backlog is full.
+
+        Dropping the oldest rather than the newest is deliberate: this is live
+        transcription, and a segment that has been waiting so long that the
+        queue filled behind it is the one the user has already stopped caring
+        about. Refusing the newest would mean the transcript freezes at the
+        moment of overload, which is the worst possible symptom.
+        """
+        try:
+            self.queue.put_nowait((seg_id, segment))
+        except asyncio.QueueFull:
+            try:
+                stale_id, _ = self.queue.get_nowait()
+                self.queue.task_done()
+                self.dropped_segments += 1
+                log.warning(
+                    "segment backlog full (%d) — dropped segment %d",
+                    SEGMENT_QUEUE_MAXSIZE,
+                    stale_id,
+                    extra={
+                        "session_id": self.session_id,
+                        "segment_id": stale_id,
+                        "event": "segment_dropped",
+                    },
+                )
+            except asyncio.QueueEmpty:
+                pass
+            self.queue.put_nowait((seg_id, segment))
+
     async def finish(self) -> None:
         """Client sent `stop`: flush, drain, run the final offline pass."""
         self.status = SessionStatus.DRAINING
@@ -276,7 +308,7 @@ class SessionState:
         segment = self.seg.flush()
         if segment:
             self.seg_id += 1
-            self.queue.put_nowait((self.seg_id, segment))
+            self._enqueue(self.seg_id, segment)
 
         await self.queue.join()
         if self.inflight:
@@ -347,7 +379,7 @@ class SessionState:
                 self.inflight.add(task)
                 task.add_done_callback(self._reap)
                 # Bound the backlog rather than queueing without limit.
-                while len(self.inflight) >= ASR_CONCURRENCY * 2:
+                while len(self.inflight) >= MAX_INFLIGHT_PER_SESSION:
                     await asyncio.wait(
                         list(self.inflight), return_when=asyncio.FIRST_COMPLETED
                     )
@@ -406,8 +438,7 @@ class SessionState:
         context = " ".join(self.recent) if self.recent else None
 
         async def one(chunk, pcm):
-            async with self.asr_slots:
-                result, limited, err = await self._asr(pcm, context)
+            result, limited, err = await self._asr(pcm, context, seg_id)
             await self._emit(chunk, result, limited, err, seg_id)
 
         await asyncio.gather(*(one(c, p) for c, p in chunks))
@@ -447,35 +478,36 @@ class SessionState:
         )
         return out
 
-    async def _asr(self, pcm: bytes, context):
-        last_err, limited = None, False
-        for attempt in range(ASR_MAX_RETRIES):
-            try:
-                r = await self.provider.transcribe_segment(
-                    pcm, settings.sample_rate, context=context
-                )
-                return r, False, None
-            except Exception as e:  # noqa: BLE001
-                if isinstance(e, (WebSocketDisconnect, RuntimeError)):
-                    raise
-                last_err = e
-                if is_rate_limit(e):
-                    limited = True
-                    log.error(
-                        "HTTP 429 from Vertex — backing off",
-                        extra={"session_id": self.session_id},
-                    )
-                    await asyncio.sleep(2**attempt)
-                    continue
-                log.warning(
-                    "ASR attempt %d/%d failed: %s",
-                    attempt + 1,
-                    ASR_MAX_RETRIES,
-                    e,
-                    extra={"session_id": self.session_id},
-                )
-                await asyncio.sleep(0.5 * (attempt + 1))
-        return None, limited, last_err
+    async def _asr(self, pcm: bytes, context, seg_id: int):
+        """Hand one chunk to the global scheduler.
+
+        Retries, jittered backoff, the per-call timeout and the process-wide
+        429 cooldown all live in ASRScheduler now. This method only has to
+        translate the outcome into the (result, limited, error) triple the
+        emit path expects.
+        """
+        try:
+            result = await self.asr.submit(
+                pcm,
+                settings.sample_rate,
+                context=context,
+                session_id=self.session_id,
+                segment_id=seg_id,
+            )
+            return result, False, None
+        except ASRQueueFull as exc:
+            log.warning(
+                "ASR capacity reached — segment %d dropped",
+                seg_id,
+                extra={
+                    "session_id": self.session_id,
+                    "segment_id": seg_id,
+                    "event": "asr_rejected",
+                },
+            )
+            return None, True, exc
+        except Exception as exc:  # noqa: BLE001
+            return None, is_rate_limit(exc), exc
 
     async def _emit(self, chunk, result, limited, err, seg_id: int) -> None:
         async with self.emit_lock:
@@ -484,9 +516,9 @@ class SessionState:
                 await self.send(
                     error_msg(
                         (
-                            "Vertex AI rejected the request (HTTP 429). Please retry."
+                            "Transcription is at capacity right now. Please retry."
                             if limited
-                            else f"transcription failed after {ASR_MAX_RETRIES} retries"
+                            else "transcription failed"
                         ),
                         seg_id,
                     )

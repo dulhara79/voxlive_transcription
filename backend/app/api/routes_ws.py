@@ -69,7 +69,7 @@ async def transcribe(ws: WebSocket) -> None:
     session = await manager.create(
         ws=ws,
         expected_speakers=_expected_speakers(ws),
-        provider=ws.app.state.provider,
+        asr_scheduler=ws.app.state.asr_scheduler,
         postproc=ws.app.state.postproc,
     )
     session.start()
