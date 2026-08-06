@@ -48,6 +48,7 @@ from typing import Awaitable, Callable, Optional
 import numpy as np
 
 from .embedder import Embedder
+from .scheduler import DiarizationQueueFull, get_scheduler
 from .speaker_engine import (
     WIN_SEC,
     SpeakerEngine,
@@ -138,6 +139,11 @@ class DiarizationService:
             self._wake.clear()
             try:
                 await self._pass()
+            except DiarizationQueueFull as exc:
+                # Best-effort by design: skipping a pass costs label freshness,
+                # never words. The next pass re-clusters the whole session
+                # anyway, so nothing is permanently lost.
+                log.warning("diarization pass skipped: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 # Diarization failing must never take the transcript with it.
                 # The user still gets their words; they get them unlabelled.
@@ -190,7 +196,10 @@ class DiarizationService:
                 return
 
             t0 = time.perf_counter()
-            embs = await asyncio.to_thread(self.embedder.embed_batch, waves)
+            # Global limiter, not asyncio's default executor: 500 sessions
+            # sharing one model still means 500 concurrent inference requests
+            # unless something says otherwise. This is that something.
+            embs = await get_scheduler().run(self.embedder.embed_batch, waves)
             self._embed_ms += (time.perf_counter() - t0) * 1000
             self._passes += 1
 
@@ -199,7 +208,9 @@ class DiarizationService:
                 return
 
             self.engine.add_windows(new)
-            changed = await asyncio.to_thread(self.engine.recluster)
+            # Re-clustering is CPU-bound and grows with session length, so it
+            # goes through the same ceiling as the embedding batch.
+            changed = await get_scheduler().run(self.engine.recluster)
 
             tl = self.engine.timeline()
             if tl:
@@ -229,7 +240,7 @@ class DiarizationService:
         if not self.enabled:
             return
         await self._pass(final=True)
-        changed = await asyncio.to_thread(self.engine.recluster)
+        changed = await get_scheduler().run(self.engine.recluster)
         if changed and self.on_change:
             await self.on_change()
 
