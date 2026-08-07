@@ -68,8 +68,15 @@ async def metrics(request: Request) -> dict:
     sessions = getattr(st, "sessions", None)
     asr = getattr(st, "asr_scheduler", None)
     diar = getattr(st, "diar_scheduler", None)
+    admission = getattr(st, "admission", None)
     return {
         "active_sessions": sessions.count() if sessions is not None else 0,
+        # Per-tenant session counts: the CloudWatch dimension that answers
+        # "which customer is consuming this task?" during an incident.
+        "sessions_by_organization": (
+            sessions.organization_breakdown() if sessions is not None else {}
+        ),
+        "admission": admission.snapshot() if admission is not None else {},
         "asr": asr.snapshot() if asr is not None else {},
         "diarization": diar.snapshot() if diar is not None else {},
     }
