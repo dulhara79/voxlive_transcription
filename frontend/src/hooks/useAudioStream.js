@@ -14,6 +14,12 @@ import { useCallback, useRef, useState } from "react";
 // hard-caps diarization identities on the backend: with speakers=2, phantom
 // "Speaker 7" labels are impossible.
 //
+// v5 (MULTI-TENANCY): the backend now REFUSES anonymous connections. Every
+// socket must identify an organization and a user, or it is closed with 1008
+// before a single audio frame is read. In development that identity comes
+// from VITE_ORG_ID / VITE_USER_ID below; once Cognito lands it becomes a
+// short-lived JWT in ?token= and these two are deleted.
+//
 // An AudioWorklet resamples whatever rate the context actually runs at down
 // to exactly 16 kHz (browsers often ignore the requested rate).
 //
@@ -22,6 +28,46 @@ import { useCallback, useRef, useState } from "react";
 const TARGET_SAMPLE_RATE = 16000;
 const STOP_FLUSH_TIMEOUT_MS = 20000;
 const LEVEL_UPDATE_MS = 100;
+
+// Development identity. Matches the seeded tenants in
+// backend/app/tenant/seed.py. Cognito replaces this entirely.
+const DEV_ORG_ID = import.meta.env.VITE_ORG_ID || "";
+const DEV_USER_ID = import.meta.env.VITE_USER_ID || "";
+
+// WebSocket close codes the backend uses deliberately. Without this mapping a
+// policy close surfaces to JavaScript as a bare "error" event, and the user is
+// told the server is down when in fact they were refused. That is the single
+// most confusing failure mode in a WebSocket app, so it is handled explicitly.
+const CLOSE_POLICY_VIOLATION = 1008; // auth / authorization failed
+const CLOSE_TRY_AGAIN_LATER = 1013; // platform full or tenant quota exhausted
+
+function describeClose(event) {
+  const reason = (event.reason || "").trim();
+  switch (event.code) {
+    case CLOSE_POLICY_VIOLATION:
+      return (
+        "Not authorised: " +
+        (reason || "the server rejected this identity.") +
+        (DEV_ORG_ID
+          ? ""
+          : " No VITE_ORG_ID / VITE_USER_ID is configured — copy" +
+            " frontend/.env.example to frontend/.env and restart Vite.")
+      );
+    case CLOSE_TRY_AGAIN_LATER:
+      return (
+        "The service is busy: " +
+        (reason || "capacity or quota reached.") +
+        " Please try again shortly."
+      );
+    case 1000: // normal closure — the stop handshake completed
+    case 1005: // no status received; the browser's default on a clean close
+      return null;
+    default:
+      return reason
+        ? `Connection closed (${event.code}): ${reason}`
+        : `Connection closed unexpectedly (code ${event.code}).`;
+  }
+}
 
 export function useAudioStream(wsUrl, onMessage) {
   const [recording, setRecording] = useState(false);
@@ -34,23 +80,46 @@ export function useAudioStream(wsUrl, onMessage) {
   const nodeRef = useRef(null);
   const lastLevelAt = useRef(0);
   const stopRef = useRef(null); // so async callbacks can trigger stop()
+  // Set when the server explicitly refused us, so onclose doesn't report the
+  // same problem a second time in less useful words.
+  const refusedRef = useRef(false);
+
+  const buildUrl = useCallback(
+    (speakers) => {
+      const url = new URL(wsUrl);
+      if (speakers > 0) url.searchParams.set("speakers", String(speakers));
+      // Identity. Sent on EVERY connection: the backend closes 1008 without it.
+      if (DEV_ORG_ID) url.searchParams.set("organization_id", DEV_ORG_ID);
+      if (DEV_USER_ID) url.searchParams.set("user_id", DEV_USER_ID);
+      return url.toString();
+    },
+    [wsUrl],
+  );
 
   const start = useCallback(
     async (source = "mic", speakers = 0) => {
       setStatus("connecting");
+      refusedRef.current = false;
 
       try {
         // 1) open the socket first. speakers>0 = the user KNOWS the count;
         // the backend caps diarization identities to exactly that many.
-        const url =
-          speakers > 0
-            ? `${wsUrl}?speakers=${encodeURIComponent(speakers)}`
-            : wsUrl;
-        const ws = new WebSocket(url);
+        const ws = new WebSocket(buildUrl(speakers));
         ws.binaryType = "arraybuffer";
         wsRef.current = ws;
+
         ws.onmessage = (e) => {
           const data = JSON.parse(e.data);
+
+          // Admission control refused this session: the platform is full, or
+          // this organization is at its plan's concurrent-session limit. The
+          // server closes right afterwards, so surface the detail now.
+          if (data.type === "rejected") {
+            refusedRef.current = true;
+            setStatus("error");
+            setRecording(false);
+          }
+
           if (data.type === "status") {
             setStatus(data.state);
             // Server confirms every queued segment has been delivered — only
@@ -63,12 +132,33 @@ export function useAudioStream(wsUrl, onMessage) {
           }
           onMessage(data);
         };
+
+        // A close can arrive INSTEAD of an open (refused during the handshake)
+        // or long after it (server shutdown, quota, network drop). Handling it
+        // in one place covers both, and is why a refusal no longer reports
+        // itself as "is the backend running?".
+        ws.onclose = (event) => {
+          const message = refusedRef.current ? null : describeClose(event);
+          if (message) {
+            onMessage({ type: "error", message });
+            setStatus("error");
+          } else if (!refusedRef.current) {
+            setStatus("idle");
+          }
+          setRecording(false);
+          setLevel(0);
+        };
+
         await new Promise((resolve, reject) => {
           ws.onopen = resolve;
+          // onerror carries no detail by design (the spec hides it to prevent
+          // port scanning). The close event that follows does, so reject with
+          // a neutral message and let onclose say what actually happened.
           ws.onerror = () =>
             reject(
               new Error(
-                "WebSocket failed to connect — is the backend running?",
+                "WebSocket could not connect. Check that the backend is " +
+                  "running and that the identity settings are correct.",
               ),
             );
         });
@@ -120,6 +210,7 @@ export function useAudioStream(wsUrl, onMessage) {
 
         console.log(
           `[VoxLive] source=${source} speakers=${speakers || "auto"} ` +
+            `org=${DEV_ORG_ID || "(none)"} ` +
             `AudioContext sampleRate = ${ctx.sampleRate}` +
             (ctx.sampleRate === TARGET_SAMPLE_RATE
               ? " (honored, passthrough)"
@@ -165,7 +256,9 @@ export function useAudioStream(wsUrl, onMessage) {
         setRecording(true);
       } catch (err) {
         // Never fail silently: permission denied, backend down, no tab audio —
-        // all of it surfaces to the transcript UI as an error row.
+        // all of it surfaces to the transcript UI as an error row. A refusal is
+        // skipped here because onmessage/onclose already reported it using the
+        // server's own wording, which is more specific than ours.
         console.error("[VoxLive] start failed:", err);
         try {
           nodeRef.current?.disconnect();
@@ -180,14 +273,16 @@ export function useAudioStream(wsUrl, onMessage) {
           wsRef.current?.close();
         } catch {}
         setRecording(false);
-        setStatus("error");
-        onMessage({
-          type: "error",
-          message: err?.message || "failed to start recording",
-        });
+        if (!refusedRef.current) {
+          setStatus("error");
+          onMessage({
+            type: "error",
+            message: err?.message || "failed to start recording",
+          });
+        }
       }
     },
-    [wsUrl, onMessage],
+    [buildUrl, onMessage],
   );
 
   const stop = useCallback(() => {
