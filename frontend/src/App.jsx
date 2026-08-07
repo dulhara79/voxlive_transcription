@@ -67,6 +67,24 @@ export default function App() {
         handleMessage(data);
       } else if (data.type === "error") {
         setErrors((prev) => [...prev, { ...data, _error: true }]);
+      } else if (data.type === "rejected") {
+        // Admission control refused the session: the platform is at capacity,
+        // or this organization has used every concurrent session on its plan.
+        // Without this branch the frame is silently dropped and the user sees
+        // nothing at all, which is worse than any error message.
+        const retry = data.retry_after_sec
+          ? ` Try again in about ${data.retry_after_sec}s.`
+          : "";
+        const usage =
+          data.limit > 0 ? ` (${data.current}/${data.limit} in use)` : "";
+        setErrors((prev) => [
+          ...prev,
+          {
+            ...data,
+            _error: true,
+            message: (data.message || "Session refused.") + usage + retry,
+          },
+        ]);
       }
     },
     [handleMessage],
