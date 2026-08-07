@@ -52,6 +52,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..api.schemas import error_msg, refresh_msg, speakers_msg, status_msg
+from ..auth.context import TenantContext
 from ..asr.scheduler import ASRQueueFull, ASRScheduler
 from ..audio.vad import Segment, VADSegmenter
 from ..config import settings
@@ -115,12 +116,18 @@ class SessionState:
         self,
         ws: WebSocket,
         session_id: str,
+        tenant: TenantContext,
         expected_speakers: int,
         asr_scheduler: ASRScheduler,
         postproc: Any,
     ):
         # ---- identity -----------------------------------------------------
         self.session_id = session_id
+        # Established once at connect time and never reassigned. Every log
+        # line, every future DB write and every S3 key derives from this.
+        self.tenant = tenant
+        self.organization_id = tenant.organization_id
+        self.user_id = tenant.user_id
         self.expected_speakers = expected_speakers
         self.created_at = time.time()
         self.last_activity = self.created_at
@@ -199,6 +206,9 @@ class SessionState:
         now = time.time()
         return {
             "session_id": self.session_id,
+            "organization_id": self.organization_id,
+            "user_id": self.user_id,
+            "plan": self.tenant.plan_code,
             "status": self.status.value,
             "age_sec": round(now - self.created_at, 1),
             "idle_sec": round(now - self.last_activity, 1),
