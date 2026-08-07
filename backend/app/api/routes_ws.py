@@ -5,43 +5,72 @@ It answers exactly one question:
 
     "How do I communicate with the browser?"
 
-Accept the socket, read the client's parameters, hand bytes to the session,
-and clean up when the connection ends. Every decision about WHAT to do with
-the audio belongs to SessionState; every decision about which sessions exist
-belongs to SessionManager. Nothing in this file should ever grow into
-processing logic — if it starts to, that logic belongs in `session/`.
+The supervisor's §16 defines the order of operations at this boundary, and
+this file implements it exactly:
 
-    browser
-       │  wss
+    Browser
+       │  WSS
        ▼
-    /ws/transcribe  ── this file
+    WebSocket Route      <- this file
        │
        ▼
-    SessionManager.create()
+    Authentication       auth/principal.py   -> TenantContext
        │
        ▼
-    SessionState.feed_audio() / .finish() / .aclose()
+    Tenant Context       auth/context.py     -> organization_id, user_id, role
+       │
+       ▼
+    Quota Check          tenant/quotas.py    -> platform capacity, then quota
+       │
+       ▼
+    Session Manager      session/manager.py
+       │
+       ├──► ASR Scheduler
+       └──► Diarization
 
-NOT YET IMPLEMENTED HERE, ON PURPOSE
-------------------------------------
-Authentication (Cognito/JWT), tenant resolution and admission control all
-belong at this boundary, and all three are later phases. The `accept()` below
-is still unconditional, exactly as in the baseline.
+Everything about WHAT to do with the audio belongs to SessionState. Nothing in
+this file should grow into processing logic.
+
+WHY THE SOCKET IS ACCEPTED BEFORE AUTHENTICATION
+------------------------------------------------
+A browser's WebSocket API cannot set request headers, and it surfaces a
+pre-handshake rejection to JavaScript as an indistinguishable "error" event —
+the page cannot tell "wrong password" from "server down". So the handshake is
+accepted, the credential is checked immediately, and a failure is reported as
+a close frame with a specific code and a readable reason. Nothing the client
+sends is processed before `resolve()` succeeds.
+
+CLOSE CODES
+-----------
+    1008  policy violation  — authentication or authorization failed
+    1013  try again later   — platform full or tenant quota exhausted
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from ..auth.context import TenantContext, reset_current, set_current
+from ..auth.principal import (
+    AuthenticationError,
+    AuthorizationError,
+    PrincipalResolver,
+)
 from ..config import settings
+from ..observability.logging import bind
 from ..session.manager import SessionManager
+from ..tenant.quotas import AdmissionController
 from .schemas import status_msg
 
 log = logging.getLogger("voxlive.ws")
 
 router = APIRouter()
+
+WS_POLICY_VIOLATION = 1008
+WS_TRY_AGAIN_LATER = 1013
 
 
 def _expected_speakers(ws: WebSocket) -> int:
@@ -61,39 +90,101 @@ def _expected_speakers(ws: WebSocket) -> int:
         return settings.expected_speakers
 
 
+async def _authenticate(ws: WebSocket) -> Optional[TenantContext]:
+    """Resolve the caller, or close the socket and return None.
+
+    The token is read from `?token=` because browsers cannot set an
+    Authorization header on a WebSocket. That places the credential in a URL,
+    so it MUST be short-lived and the ALB access logs must not record query
+    strings — both are deployment requirements for the Cognito commit, not
+    optional hardening.
+    """
+    resolver: PrincipalResolver = ws.app.state.principal_resolver
+    try:
+        return await resolver.resolve(
+            ws.query_params.get("token"),
+            organization_id=ws.query_params.get("organization_id"),
+            user_id=ws.query_params.get("user_id"),
+        )
+    except AuthenticationError as exc:
+        log.warning("authentication failed: %s", exc)
+        await ws.close(code=WS_POLICY_VIOLATION, reason=str(exc)[:120])
+    except AuthorizationError as exc:
+        log.warning("authorization failed: %s", exc)
+        await ws.close(code=WS_POLICY_VIOLATION, reason=str(exc)[:120])
+    return None
+
+
 @router.websocket("/ws/transcribe")
 async def transcribe(ws: WebSocket) -> None:
     await ws.accept()
 
+    tenant = await _authenticate(ws)
+    if tenant is None:
+        return
+
+    if not tenant.can_start_session:
+        await ws.close(
+            code=WS_POLICY_VIOLATION,
+            reason=f"role {tenant.role.value} cannot start sessions",
+        )
+        return
+
+    # Platform capacity first, then this organization's quota.
+    admission: AdmissionController = ws.app.state.admission
+    decision = await admission.admit(tenant)
+    if not decision.allowed:
+        # Send the detail as JSON before closing: the close reason is capped
+        # at 123 bytes and clients render it poorly, but a JSON frame lets the
+        # UI show the plan limit and a retry countdown.
+        await ws.send_json({"type": "rejected", **decision.as_dict()})
+        await ws.close(code=WS_TRY_AGAIN_LATER, reason=decision.reason.value)
+        log.info(
+            "session refused: %s (%d/%d)",
+            decision.reason.value,
+            decision.current,
+            decision.limit,
+            extra=tenant.log_fields(),
+        )
+        return
+
     manager: SessionManager = ws.app.state.sessions
     session = await manager.create(
         ws=ws,
+        tenant=tenant,
         expected_speakers=_expected_speakers(ws),
         asr_scheduler=ws.app.state.asr_scheduler,
         postproc=ws.app.state.postproc,
     )
-    session.start()
-    await session.send(status_msg("ready"))
 
+    # Ambient context for anything downstream that is too deep to be handed
+    # the object, and log fields for every line emitted under this task.
+    token = set_current(session.tenant)
     try:
-        while True:
-            msg = await ws.receive()
+        with bind(**session.tenant.log_fields()):
+            session.start()
+            await session.send(status_msg("ready"))
 
-            if msg.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect(msg.get("code", 1000))
+            try:
+                while True:
+                    msg = await ws.receive()
 
-            if msg.get("bytes") is not None:
-                await session.feed_audio(msg["bytes"])
+                    if msg.get("type") == "websocket.disconnect":
+                        raise WebSocketDisconnect(msg.get("code", 1000))
 
-            elif msg.get("text") == "stop":
-                await session.finish()
+                    if msg.get("bytes") is not None:
+                        await session.feed_audio(msg["bytes"])
 
-    except WebSocketDisconnect:
-        log.info(
-            "client disconnected after %d segment(s)",
-            session.seg_id,
-            extra={"session_id": session.session_id},
-        )
+                    elif msg.get("text") == "stop":
+                        await session.finish()
+
+            except WebSocketDisconnect:
+                log.info(
+                    "client disconnected after %d segment(s)",
+                    session.seg_id,
+                )
+            finally:
+                await manager.remove(session.session_id)
+                await session.aclose()
     finally:
-        await manager.remove(session.session_id)
-        await session.aclose()
+        reset_current(token)
