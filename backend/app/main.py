@@ -50,11 +50,15 @@ from .api.routes_health import router as health_router
 from .api.routes_ws import router as ws_router
 from .asr.postprocess import PostProcessor
 from .asr.scheduler import ASRScheduler
+from .auth.principal import build_resolver
 from .config import APP_ENV, settings
 from .diarization import scheduler as diar_scheduler
 from .diarization.factory import warmup_backend
 from .observability.logging import configure_logging
 from .session.manager import SessionManager
+from .tenant.quotas import AdmissionController, CapacityManager, QuotaManager
+from .tenant.repository import InMemoryTenantRepository
+from .tenant.seed import seed_development_tenants
 
 log = logging.getLogger("voxlive")
 
@@ -119,6 +123,27 @@ async def lifespan(app: FastAPI):
         max_concurrency=_int("DIARIZATION_MAX_CONCURRENCY", 2),
         queue_maxsize=_int("DIARIZATION_QUEUE_MAXSIZE", 32),
     )
+
+    # ---- multi-tenancy -----------------------------------------------------
+    # InMemoryTenantRepository today; the PostgreSQL commit swaps in
+    # SqlTenantRepository here and nothing else in the application changes.
+    app.state.tenants = InMemoryTenantRepository()
+    if APP_ENV == "development":
+        await seed_development_tenants(app.state.tenants)
+
+    # Fails closed: outside development this raises until Cognito exists,
+    # rather than serving unauthenticated tenant traffic.
+    app.state.principal_resolver = build_resolver(app.state.tenants, APP_ENV)
+
+    capacity = CapacityManager(
+        max_sessions=_int("MAX_CONCURRENT_SESSIONS", 50),
+        count_fn=app.state.sessions.count,
+    )
+    quotas = QuotaManager(
+        repo=app.state.tenants,
+        count_for_organization=app.state.sessions.count_for_organization,
+    )
+    app.state.admission = AdmissionController(capacity, quotas)
 
     await warmup_backend(settings)
 
