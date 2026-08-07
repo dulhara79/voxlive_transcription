@@ -33,6 +33,8 @@ import struct
 from dataclasses import dataclass
 from typing import Optional
 
+from .validation import clean_transcript
+
 log = logging.getLogger("voxlive.gemini")
 
 LANG_NAMES = {"si": "Sinhala", "ta": "Tamil", "en": "English"}
@@ -111,11 +113,19 @@ class GeminiProvider:
             "script, Tamil in Tamil script, English in Latin script. If a "
             "sentence mixes languages, keep the mix and keep each part in its "
             "own script — do not romanise Sinhala or Tamil.\n"
+            "2b. Use ONLY Sinhala, Tamil and Latin script. Never output "
+            "Thaana/Dhivehi, Devanagari, Arabic, Kannada, Malayalam, Telugu, "
+            "Bengali or any other script. Sinhala is frequently confused with "
+            "Thaana — if audio sounds like an unfamiliar South Asian "
+            "language, it is Sinhala or Tamil, or it is not speech.\n"
             "3. `language` is the language of the MAJORITY of the words. Use "
             "exactly one of: " + ", ".join(self.allowed) + ".\n"
             "4. If the audio is silence, noise, breathing or music, return an "
             "empty string for `text`. Never invent speech. An empty result is "
             "always better than a plausible guess.\n"
+            "4b. Never repeat a word or phrase over and over. If you find "
+            "yourself repeating, the audio is unintelligible: stop and return "
+            "what you were certain of, or an empty string.\n"
             "5. The clip is a fragment of a longer conversation. It may begin "
             "or end mid-word. Transcribe the fragment as heard; do not pad it.\n"
             "6. No preamble, no commentary, no speaker labels, no timestamps."
@@ -193,8 +203,8 @@ class GeminiProvider:
         if not text:
             return ASRResult("", lang)
 
-        # Hallucination guard: nobody speaks 8 words a second. A burst well
-        # above human rate means the model looped on noise.
+        # Guard 1 — RATE. Nobody speaks 8 words a second. A burst well above
+        # human rate means the model looped on noise. Catches FAST failure.
         words = len(text.split())
         if duration > 0.4 and words / duration > self.max_wps:
             log.info(
@@ -205,4 +215,19 @@ class GeminiProvider:
             )
             return ASRResult("", lang)
 
-        return ASRResult(text, lang)
+        # Guard 2 — CONTENT. Catches SLOW failure, which the rate guard cannot
+        # see: fluent-looking output in a script we never asked for, or a
+        # phrase repeating like a stuck decoder. `language` being a valid enum
+        # value says nothing about the characters in `text`, so this is the
+        # only place the actual script is ever checked.
+        cleaned, dropped = clean_transcript(text, self.allowed)
+        if dropped:
+            log.warning(
+                "content guard: dropping %.1fs segment (%s)",
+                duration,
+                dropped,
+                extra={"event": "asr_content_rejected", "reason": dropped},
+            )
+            return ASRResult("", lang)
+
+        return ASRResult(cleaned, lang)
