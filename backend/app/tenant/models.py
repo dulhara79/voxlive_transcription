@@ -179,6 +179,11 @@ class User:
     role: UserRole = UserRole.MEMBER
     status: UserStatus = UserStatus.ACTIVE
     cognito_sub: Optional[str] = None
+    # scrypt hash produced by auth/passwords.py. Nullable because an INVITED
+    # user exists before they have chosen one, and because a future Cognito
+    # migration would leave this empty for every federated account.
+    # `repr=False` keeps it out of tracebacks and log lines that print a User.
+    password_hash: Optional[str] = field(default=None, repr=False)
     created_at: float = field(default_factory=time.time)
 
     @classmethod
