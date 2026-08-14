@@ -26,10 +26,26 @@ from __future__ import annotations
 
 import logging
 
+from ..auth.passwords import hash_password
 from .models import Organization, OrganizationStatus, User, UserRole, UserStatus
 from .repository import TenantRepository
 
 log = logging.getLogger("voxlive.tenant")
+
+# Every seeded user shares this password so the login screen is usable the
+# moment the stack starts. Seeding only runs under APP_ENV=development.
+DEV_PASSWORD = "voxlive-dev-password"
+
+
+_CACHED_HASH: str | None = None
+
+
+def _dev_hash() -> str:
+    """Hash the shared dev password once — scrypt is ~60 ms per call."""
+    global _CACHED_HASH
+    if _CACHED_HASH is None:
+        _CACHED_HASH = hash_password(DEV_PASSWORD)
+    return _CACHED_HASH
 
 
 async def seed_development_tenants(repo: TenantRepository) -> None:
@@ -61,6 +77,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
             email="alice@acme.example",
             name="Alice",
             role=UserRole.ADMIN,
+            password_hash=_dev_hash(),
             cognito_sub="dev-sub-alice",
         ),
         User(
@@ -69,6 +86,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
             email="bob@acme.example",
             name="Bob",
             role=UserRole.MEMBER,
+            password_hash=_dev_hash(),
             cognito_sub="dev-sub-bob",
         ),
         User(
@@ -77,6 +95,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
             email="carol@acme.example",
             name="Carol",
             role=UserRole.VIEWER,
+            password_hash=_dev_hash(),
             cognito_sub="dev-sub-carol",
         ),
         User(
@@ -85,6 +104,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
             email="dave@globex.example",
             name="Dave",
             role=UserRole.OWNER,
+            password_hash=_dev_hash(),
             cognito_sub="dev-sub-dave",
         ),
         User(
@@ -94,6 +114,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
             name="Erin",
             role=UserRole.OWNER,
             status=UserStatus.ACTIVE,
+            password_hash=_dev_hash(),
             cognito_sub="dev-sub-erin",
         ),
     ]
