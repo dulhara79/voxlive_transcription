@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState, useEffect } from "react";
 import { useAudioStream } from "./hooks/useAudioStream";
 import { useTranscript } from "./components/TranscriptView.jsx";
 import TranscriptView from "./components/TranscriptView.jsx";
+import { useAuth } from "./auth/AuthContext.jsx";
 
 const WS_URL =
   (import.meta.env.VITE_WS_URL || "ws://localhost:8000") + "/ws/transcribe";
@@ -39,6 +40,7 @@ const SOURCES = [
 const SPEAKER_CHOICES = [0, 2, 3, 4, 5, 6];
 
 export default function App() {
+  const { user, signOut } = useAuth();
   const [source, setSource] = useState("mic");
   const [expectedSpeakers, setExpectedSpeakers] = useState(0);
   const [errors, setErrors] = useState([]);
@@ -218,6 +220,7 @@ export default function App() {
         <div className="flex items-center gap-4">
           {recording && <LevelMeter level={level} />}
           <StatusPill status={status} recording={recording} />
+          <AccountMenu user={user} onSignOut={signOut} recording={recording} />
         </div>
       </header>
 
@@ -508,4 +511,42 @@ function tsForFilename() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(
     d.getHours(),
   )}-${p(d.getMinutes())}`;
+}
+
+/**
+ * AccountMenu — which organization this transcript belongs to, and a way out.
+ *
+ * The organization name is shown rather than only the email because it is the
+ * thing that changes what the session does: quota, plan and every stored
+ * transcript are scoped to it, and a person with accounts at two customers
+ * otherwise has no way to tell which one they are recording into.
+ *
+ * Sign out is disabled while recording. It drops the token, which closes the
+ * socket mid-sentence and loses an undownloaded transcript.
+ */
+function AccountMenu({ user, onSignOut, recording }) {
+  if (!user) return null;
+  return (
+    <div className="flex items-center gap-3 border-l border-neutral-200 pl-4">
+      <div className="hidden text-right leading-tight sm:block">
+        <div className="text-xs font-medium text-neutral-700">
+          {user.organizationName}
+        </div>
+        <div className="text-[11px] text-neutral-400">{user.email}</div>
+      </div>
+      <button
+        type="button"
+        onClick={onSignOut}
+        disabled={recording}
+        title={
+          recording
+            ? "Stop the recording before signing out"
+            : "Sign out of VoxLive"
+        }
+        className="rounded-full border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        Sign out
+      </button>
+    </div>
+  );
 }
