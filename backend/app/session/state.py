@@ -57,6 +57,7 @@ from ..asr.scheduler import ASRQueueFull, ASRScheduler
 from ..audio.vad import Segment, VADSegmenter
 from ..config import settings
 from ..diarization.factory import build_diarizer
+from ..tenant.models import PLANS
 from .transcript import TranscriptStore
 
 log = logging.getLogger("voxlive.session")
@@ -168,6 +169,18 @@ class SessionState:
         self.seg_id = 0
         self.sequence = 0  # outbound message counter
         self.dead = False
+
+        # ---- hard duration cap ---------------------------------------------
+        # `Plan.max_session_minutes` existed in the model and was enforced
+        # nowhere, so a browser tab left open on a stream billed Vertex AI for
+        # as long as it stayed open. Admission control only ever counted
+        # CONCURRENT sessions, which does not bound the duration of any of
+        # them. This is the cheapest possible ceiling: it costs one float
+        # comparison per audio chunk and it is the difference between a
+        # forgotten tab costing minutes and costing a weekend.
+        plan = PLANS.get(tenant.plan_code)
+        self.max_audio_sec = (plan.max_session_minutes * 60) if plan else 0
+        self.limit_reached = False
         self.last_speaker_count = 0
         self._last_beat = 0.0
 
@@ -261,6 +274,32 @@ class SessionState:
     async def feed_audio(self, pcm: bytes) -> None:
         """Accept one chunk of raw int16 PCM from the client."""
         self.last_activity = time.time()
+
+        # Stop ACCEPTING audio at the plan ceiling, then drain normally, so
+        # the user keeps every word already transcribed. Dropping the socket
+        # outright would discard whatever is still in flight and leave them
+        # with a truncated transcript and no explanation.
+        if (
+            self.max_audio_sec
+            and not self.limit_reached
+            and self.seg.now >= self.max_audio_sec
+        ):
+            self.limit_reached = True
+            log.info(
+                "session reached the %.0f-minute plan limit; draining",
+                self.max_audio_sec / 60,
+                extra={"session_id": self.session_id, "event": "session_limit"},
+            )
+            await self.send(
+                error_msg(
+                    f"This session reached its {self.max_audio_sec // 60}-minute "
+                    "limit. Download the transcript, then start a new one."
+                )
+            )
+            await self.finish()
+            return
+        if self.limit_reached:
+            return
 
         # Raw audio goes to the diarizer CONTINUOUSLY — it does its own VAD and
         # needs an uninterrupted clock, not VAD segments with pre-roll padding
