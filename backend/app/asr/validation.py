@@ -1,8 +1,40 @@
 """
 validation.py — content checks on ASR output.
 
-WHY THIS EXISTS
----------------
+WHAT CHANGED IN THIS REVISION, AND WHY
+--------------------------------------
+The previous version had the drop rule backwards. It dropped on TOKEN COUNT:
+
+    if len(cleaned.split()) < MIN_TOKENS_AFTER_STRIP:   # 3
+        return "", "foreign script ..., nothing usable left"
+
+`MIN_TOKENS_AFTER_STRIP` was written to mean "too little survived the strip to
+trust", but it was applied to text that had never been stripped at all. The
+measured consequence:
+
+    'ඔව්'       -> dropped   ("foreign script 0%, nothing usable left")
+    'හරි'       -> dropped
+    'thank you' -> dropped
+    'ஆம் சரி'   -> dropped
+    'ok ok ok ok ok ok ok' -> KEPT
+
+Every one- and two-word turn was silently deleted while a seven-token decoder
+loop passed. In live Sinhala/Tamil conversation short answers are a large
+share of all turns, so this was removing real speech continuously and only
+ever surfacing in the logs as a foreign-script warning.
+
+The rule is now conditional on CONTAMINATION, not on length:
+
+    * nothing survived the strip                     -> drop
+    * most of the text was foreign AND the remnant
+      is too short to stand on its own               -> drop
+    * otherwise                                      -> keep what survived
+
+A clean short utterance has a foreign share of 0.0, so it is never eligible
+for the second branch and is always kept.
+
+THE ORIGINAL FAILURE THIS MODULE EXISTS FOR
+-------------------------------------------
 A real transcript from this system contained a paragraph labelled `si`
 (Sinhala) whose characters measured:
 
@@ -11,8 +43,8 @@ A real transcript from this system contained a paragraph labelled `si`
     Arabic      7 chars    1.5%
     Kannada     5 chars    1.1%
 
-Every guard in the pipeline passed it, because each one was checking the
-wrong thing:
+Every guard in the pipeline passed it, because each was checking the wrong
+thing:
 
   ALLOWED_LANGUAGES     `state.py` checks `result.language not in allowed`.
                         The model returned "si". That is a LABEL check; it
@@ -22,48 +54,31 @@ wrong thing:
                         unconstrained STRING — no JSON schema can restrict
                         which script a string is written in.
 
-  MAX_WORDS_PER_SEC     The whole paragraph is ~3.3 words/sec over 33 s; the
-                        Thaana burst alone is ~5 w/s in a 9 s segment. Both
-                        are far under the 8.0 limit. That guard catches FAST
-                        hallucination (a model looping on noise); this one is
-                        slow and fluent, so the guard could never fire.
+  MAX_WORDS_PER_SEC     The paragraph is ~3.3 words/sec over 33 s. That guard
+                        catches FAST hallucination (a model looping on noise);
+                        this one was slow and fluent, so it could never fire.
 
-So there was no check on the characters themselves. That is what this module
-adds.
+FOUR CHECKS, IN ORDER
+---------------------
+    1. SCRIPT       Strip tokens written in a script we did not ask for.
+    2. RUN          Drop text containing an immediate run of one repeated
+                    token — the shortest, most obvious decoder loop, and the
+                    one the n-gram check below is too coarse to see.
+    3. REPETITION   Drop text that repeats itself across a longer window.
+    4. ECHO         Drop text that is mostly a copy of the rolling context we
+                    sent as a hint. The model continued the prompt instead of
+                    reading the audio.
 
-WHY THE MODEL DID IT
---------------------
-The garbage is a textbook degenerate decoding loop — the token `ހކއހވ`
-appears 7 times and a ~12-token phrase repeats nearly verbatim 4 times. The
-model lost the audio and started generating from its own prior. Contributing
-factors, in rough order of importance:
-
-  1. No script constraint existed, so nothing pushed back.
-  2. Sinhala and Thaana are both low-resource South Asian scripts. On unclear
-     or noisy Sinhala the audio encoder has weak separation between them.
-  3. The segment that produced it ended on `max_len` (9 s), not on a natural
-     pause — the longest, least-bounded input the pipeline can produce.
-  4. `temperature=0.0`. Greedy decoding is MORE prone to repetition loops
-     than low-temperature sampling, not less. This is counter-intuitive and
-     worth testing separately.
-
-TWO CHECKS, IN ORDER
---------------------
-    1. SCRIPT      Strip tokens written in a script we did not ask for.
-                   Drop the segment entirely if most of it was foreign.
-    2. REPETITION  Drop text that repeats itself like a stuck decoder —
-                   this also catches loops that stay in Sinhala script.
-
-Measured on the real sample: real speech has a unique-token ratio of 0.82 and
-a top 3-gram repeated twice; the hallucination scores 0.33 and 4. The
-thresholds below sit between those, well clear of both.
+Checks 2 and 4 are new. Check 4 closes a gap the README already claimed was
+closed: there was no context-echo guard anywhere in the pipeline, only an
+exact-match comparison against the single previous segment in `state.py`.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, Optional
 
 log = logging.getLogger("voxlive.asr.validation")
 
@@ -97,26 +112,38 @@ NEUTRAL_CODEPOINTS = frozenset(
 # does not delete the word.
 TOKEN_FOREIGN_RATIO = 0.5
 
-# Foreign tokens are ALWAYS removed — they are definitionally wrong, so
-# keeping the remainder cannot reintroduce garbage. The segment is therefore
-# dropped only when nothing usable survives, not because the foreign SHARE
-# was high. An earlier version dropped anything above 60% foreign; measured
-# against the real sample that discarded 34 tokens of clean Sinhala (unique
-# ratio 1.0, zero foreign characters) alongside the garbage. Losing real
-# speech is the worse failure.
-MIN_TOKENS_AFTER_STRIP = 3
+# Drop the whole segment only when the text was BADLY contaminated and what
+# survived is too short to stand on its own. BOTH conditions are required.
+# A clean segment has foreign_share == 0.0 and can never reach this branch,
+# which is precisely the bug this replaced.
+HEAVY_CONTAMINATION_SHARE = 0.5
+MIN_TOKENS_AFTER_HEAVY_STRIP = 3
 
 # Above this share, log at WARNING rather than INFO. Not a drop trigger — a
 # monitoring signal. A rising foreign-script rate is the earliest evidence
-# that the model, the region or the audio quality has degraded, and it is
-# far more useful as a metric than as a silent deletion.
+# that the model, the region or the audio quality has degraded.
 FOREIGN_SHARE_ALARM = 0.25
 
-# Repetition. Only applied once there are enough tokens for the ratio to mean
-# something; short utterances legitimately repeat ("ලණු කන්න එපා").
+# --- repetition -------------------------------------------------------------
+# An immediate run of the SAME token. Catches "ok ok ok ok" and
+# "හරි හරි හරි හරි", which the 3-gram check cannot see because it needs 12
+# tokens before it will look at anything. Four is deliberately conservative:
+# natural speech repeats a word twice for emphasis and occasionally three
+# times, but four identical tokens in a row is a decoder loop.
+MAX_TOKEN_RUN = 4
+
+# Longer-window repetition. Only applied once there are enough tokens for the
+# ratio to mean something; short utterances legitimately repeat.
 REPETITION_MIN_TOKENS = 12
 REPETITION_UNIQUE_RATIO = 0.45  # real speech measured 0.82, garbage 0.33
 REPETITION_MAX_NGRAM_REPEATS = 3  # real speech 2, garbage 4
+
+# --- context echo -----------------------------------------------------------
+# The provider sends recent transcript as a spelling hint. When the model
+# loses the audio it sometimes continues that hint instead. Measured as the
+# share of the output's 3-grams that already appear in the context.
+ECHO_MIN_TOKENS = 5
+ECHO_CONTAINMENT = 0.80
 
 
 def _is_neutral(ch: str) -> bool:
@@ -158,6 +185,31 @@ def script_profile(text: str, ranges: Iterable[tuple[int, int]]) -> tuple[int, i
     return allowed, foreign
 
 
+def dominant_language(text: str) -> Optional[str]:
+    """Which of si / ta / en the text is mostly written in, or None.
+
+    Used to CORRECT the model's own `language` label. The label and the text
+    are produced independently — the response schema constrains one and not
+    the other — so a Sinhala-script paragraph labelled `en` is a routine
+    outcome, and the frontend colours turns by that label.
+    """
+    counts: dict[str, int] = {}
+    for code, ranges in SCRIPT_RANGES.items():
+        counts[code] = sum(
+            1 for ch in text if not _is_neutral(ch) and _in_ranges(ch, ranges)
+        )
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    # Sinhala and Tamil beat Latin on ties: a code-switched Sinhala sentence
+    # carrying two English brand names is a Sinhala turn, not an English one.
+    for code in ("si", "ta"):
+        if counts[code] and counts[code] >= counts["en"]:
+            return code
+    best = max(counts, key=lambda c: counts[c])
+    return best if counts[best] else None
+
+
 def strip_foreign_scripts(
     text: str, ranges: Iterable[tuple[int, int]]
 ) -> tuple[str, float]:
@@ -187,16 +239,38 @@ def strip_foreign_scripts(
     return " ".join(kept), share
 
 
+def longest_token_run(tokens: list[str]) -> int:
+    """Length of the longest run of consecutive identical tokens."""
+    best = run = 0
+    previous: Optional[str] = None
+    for token in tokens:
+        key = token.strip(".,!?…:;").casefold()
+        if key and key == previous:
+            run += 1
+        else:
+            run = 1
+            previous = key
+        best = max(best, run)
+    return best
+
+
 def looks_degenerate(text: str) -> bool:
     """True when the text repeats itself like a stuck decoder.
 
     Catches loops that stay INSIDE an allowed script, which the script filter
-    cannot see. Two independent signals, either of which is enough:
+    cannot see. Three independent signals, any of which is enough:
 
+      * an immediate run of one token — the shortest possible loop
       * low unique-token ratio — the model is cycling a small vocabulary
       * one 3-gram appearing many times — the model is cycling a phrase
     """
     tokens = text.split()
+    if not tokens:
+        return False
+
+    if longest_token_run(tokens) >= MAX_TOKEN_RUN:
+        return True
+
     if len(tokens) < REPETITION_MIN_TOKENS:
         return False
 
@@ -210,7 +284,51 @@ def looks_degenerate(text: str) -> bool:
     return False
 
 
-def clean_transcript(text: str, languages: Iterable[str]) -> tuple[str, str | None]:
+def echoes_context(text: str, context: Optional[str]) -> bool:
+    """True when the output is mostly a copy of the context hint.
+
+    The provider sends recent transcript so the model spells names
+    consistently. A model that has lost the audio will sometimes transcribe
+    that hint instead — producing fluent, correct-looking text that describes
+    audio from ten seconds ago. Nothing else in the pipeline can see this:
+    the script is right, the language is right, and it does not repeat itself.
+
+    Containment rather than similarity, because the echo is usually a SUBSET
+    of the context, not the whole of it.
+    """
+    if not context:
+        return False
+
+    tokens = text.split()
+    if len(tokens) < ECHO_MIN_TOKENS:
+        # Short confirmations legitimately recur across turns. Dropping "හරි"
+        # because it appeared thirty seconds ago is the same class of mistake
+        # this module was rewritten to remove.
+        return False
+
+    ctx_tokens = context.split()
+    if len(ctx_tokens) < 3:
+        return False
+
+    ctx_grams = {
+        tuple(t.casefold() for t in ctx_tokens[i : i + 3])
+        for i in range(len(ctx_tokens) - 2)
+    }
+    grams = [
+        tuple(t.casefold() for t in tokens[i : i + 3]) for i in range(len(tokens) - 2)
+    ]
+    if not grams:
+        return False
+
+    contained = sum(1 for g in grams if g in ctx_grams) / len(grams)
+    return contained >= ECHO_CONTAINMENT
+
+
+def clean_transcript(
+    text: str,
+    languages: Iterable[str],
+    context: Optional[str] = None,
+) -> tuple[str, str | None]:
     """Validate one ASR result.
 
     Returns `(cleaned_text, reason_if_dropped)`. An empty string with a reason
@@ -222,12 +340,25 @@ def clean_transcript(text: str, languages: Iterable[str]) -> tuple[str, str | No
 
     ranges = allowed_ranges(languages)
     cleaned, foreign_share = strip_foreign_scripts(text, ranges)
+    tokens = cleaned.split()
 
-    if len(cleaned.split()) < MIN_TOKENS_AFTER_STRIP:
-        return "", f"foreign script {foreign_share:.0%}, nothing usable left"
+    if not tokens:
+        return "", f"foreign script {foreign_share:.0%}, nothing survived"
+
+    # Only heavy contamination justifies discarding the remainder. A clean
+    # segment has foreign_share == 0.0 and never reaches this branch, however
+    # short it is.
+    if (
+        foreign_share >= HEAVY_CONTAMINATION_SHARE
+        and len(tokens) < MIN_TOKENS_AFTER_HEAVY_STRIP
+    ):
+        return "", f"foreign script {foreign_share:.0%}, remnant too short to trust"
 
     if looks_degenerate(cleaned):
         return "", "repetition loop"
+
+    if echoes_context(cleaned, context):
+        return "", "echoed the context hint instead of the audio"
 
     if foreign_share > 0:
         log.log(
