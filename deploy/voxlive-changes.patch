@@ -1,0 +1,3071 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index dfa8784..4c75e63 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -33,7 +33,15 @@ ALLOWED_LANGUAGES=si,en,ta
+ 
+ # ---- Anti-hallucination gates ----
+ MIN_SEGMENT_RMS=120
++
++# TWO rate gates, because neither covers all three languages. Words-per-second
++# catches English loops. Sinhala and Tamil agglutinate, so a runaway segment in
++# either stays well under the WORD limit while its character count explodes --
++# a Sinhala loop can emit 400 characters in 3 s and still measure ~2 w/s.
++# Characters-per-second is the scale-free version of the same check. A segment
++# only has to trip ONE of them to be dropped.
+ MAX_WORDS_PER_SEC=8.0
++MAX_CHARS_PER_SEC=28.0
+ 
+ # ---- Audio / VAD segmentation ----
+ SAMPLE_RATE=16000
+@@ -51,6 +59,15 @@ MAX_SEGMENT_MS=9000
+ MIN_SEGMENT_MS=300
+ 
+ # ---- Rolling ASR context ----
++# Sent to the model as a spelling/vocabulary hint on every call. It is now
++# AUDITED on the way back: if the returned text is mostly a copy of this hint,
++# the model continued the prompt instead of reading the audio and the segment
++# is dropped (validation.echoes_context). Setting this to 0 disables the hint
++# entirely -- which also removes the hallucination class it can cause, at the
++# cost of worse proper nouns and code-switch boundaries.
++#
++# Each segment's call carries up to 1200 extra characters of input because of
++# this. That is a real Gemini line item; see deploy/AWS_COST.md.
+ CONTEXT_SEGMENTS=4
+ 
+ # ============================================================
+@@ -123,7 +140,40 @@ ENABLE_POSTPROCESS=false
+ # ---- Concurrency ----
+ ASR_CONCURRENCY=6
+ 
++# ============================================================
++# AUTHENTICATION
++# ============================================================
++# HS256 signing key for the tokens issued by POST /auth/login. Generate one:
++#
++#   python -c "import secrets; print(secrets.token_urlsafe(48))"
++#
++# REQUIRED outside APP_ENV=development -- build_resolver() touches it at
++# start-up and refuses to boot without it. That is deliberate: every task
++# behind the load balancer must sign with the SAME key, or a token minted by
++# task A is rejected by task B and logins fail at random. In development an
++# ephemeral per-process key is generated instead, so every restart signs
++# everyone out.
++#
++# On AWS this belongs in Secrets Manager and reaches the container as a task
++# definition `secrets` entry, never as a plain `environment` value -- the
++# latter is visible to anyone who can call DescribeTaskDefinition.
++AUTH_JWT_SECRET=
++
++# How long an access token is valid. It travels in the WebSocket URL as
++# ?token=, because the browser WebSocket API cannot set an Authorization
++# header -- so it reaches browser history and any proxy that logs query
++# strings. Keep this short, and make sure ALB access logging is NOT recording
++# query strings.
++AUTH_ACCESS_TTL_SEC=43200
++
++# The second step of login, used only when one email + password matches
++# accounts in more than one organization. Just long enough to read a list and
++# click.
++AUTH_ORG_SELECT_TTL_SEC=300
++
+ # ---- CORS ----
++# Must include the origin the frontend is served from, or the browser blocks
++# every /auth call before it reaches FastAPI.
+ CORS_ORIGINS=http://localhost:5173
+ 
+ # ============================================================
+diff --git a/backend/app/api/routes_auth.py b/backend/app/api/routes_auth.py
+new file mode 100644
+index 0000000..05d976d
+--- /dev/null
++++ b/backend/app/api/routes_auth.py
+@@ -0,0 +1,412 @@
++"""
++routes_auth.py — signup, sign-in, and "who am I".
++
++    POST /auth/signup              create an organization and its owner
++    POST /auth/login               email + password
++    POST /auth/login/organization  second step, only when the email is
++                                   registered in more than one organization
++    GET  /auth/me                  the current token's identity
++
++WHY LOGIN CAN NEED TWO STEPS
++----------------------------
++The schema makes email unique PER ORGANIZATION, not globally:
++
++    CONSTRAINT users_email_per_org_uq UNIQUE (organization_id, email)
++
++That is the right constraint — a contractor may hold accounts at two
++customers — but it means an email address does not identify a person. A login
++endpoint that looks up one row by email will sign someone into whichever
++organization the database returned first, and the bug is invisible until the
++day a shared email exists.
++
++So the flow is:
++
++    1. verify the password against EVERY user row carrying that email
++    2. exactly one matched   -> issue an access token, done, one step
++    3. several matched       -> return the organization names plus a
++                                short-lived org_select token, and let the
++                                person choose
++    4. none matched          -> one generic failure
++
++Step 3 asks WHICH ORGANIZATION only after the password is already proven, so
++the organization list is never exposed to someone who cannot authenticate.
++Asking for the organization first — the obvious design — would turn this
++endpoint into a "does this person work at that company" lookup for anyone.
++
++WHAT IS DELIBERATELY NOT HERE
++-----------------------------
++Password reset and invitations. Both need outbound email, which is a service,
++a domain, a DKIM record and a bounce policy. Adding a half-built version now
++would leave a live endpoint that mints reset tokens nobody can deliver.
++Until then, an owner adds members and sets the initial password.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import time
++from typing import Optional
++
++from fastapi import APIRouter, Header, HTTPException, Request, status
++from pydantic import BaseModel, EmailStr, Field
++
++from ..auth.passwords import (
++    MIN_PASSWORD_LENGTH,
++    PasswordError,
++    hash_password,
++    needs_rehash,
++    verify_password,
++)
++from ..auth.tokens import (
++    TokenError,
++    issue_access_token,
++    issue_org_select_token,
++    read_access_token,
++    read_org_select_token,
++)
++from ..tenant.models import (
++    Organization,
++    OrganizationStatus,
++    User,
++    UserRole,
++    UserStatus,
++)
++from ..tenant.repository import DuplicateEmailError, TenantRepository
++
++log = logging.getLogger("voxlive.auth")
++
++router = APIRouter(prefix="/auth", tags=["auth"])
++
++# One message for every authentication failure. "No such account" and "wrong
++# password" as separate messages turn this endpoint into a directory of who
++# holds an account.
++GENERIC_LOGIN_FAILURE = "That email and password combination didn't work."
++
++# A dummy hash with the current parameters. Verified against when no candidate
++# user exists, so a request for an unknown email costs the same wall-clock as
++# one for a known email. Without it, response time answers the question the
++# error message refuses to.
++_TIMING_DECOY = hash_password("timing-decoy-not-a-real-password")
++
++# ---------------------------------------------------------------------------
++# Rate limiting.
++#
++# This is PER PROCESS. Behind two Fargate tasks the effective limit doubles,
++# and it resets on deploy. It is here because a scrypt verify is ~60 ms of CPU
++# and an unthrottled login endpoint is therefore a cheap way to saturate the
++# service — not because it is a complete answer to credential stuffing. The
++# durable version belongs in front of the app, and on AWS the free option is
++# an ALB rule or WAF rate-based rule rather than anything in this file.
++# ---------------------------------------------------------------------------
++LOGIN_WINDOW_SEC = 300
++LOGIN_MAX_ATTEMPTS = 10
++_attempts: dict[str, list[float]] = {}
++_attempts_lock = asyncio.Lock()
++
++
++async def _rate_limit(key: str) -> None:
++    now = time.monotonic()
++    async with _attempts_lock:
++        hits = [t for t in _attempts.get(key, ()) if now - t < LOGIN_WINDOW_SEC]
++        if len(hits) >= LOGIN_MAX_ATTEMPTS:
++            raise HTTPException(
++                status.HTTP_429_TOO_MANY_REQUESTS,
++                detail="Too many sign-in attempts. Wait a few minutes and try again.",
++            )
++        hits.append(now)
++        _attempts[key] = hits
++        # Opportunistic sweep so the dict cannot grow without bound on a
++        # long-lived task.
++        if len(_attempts) > 4096:
++            for stale in [
++                k
++                for k, v in _attempts.items()
++                if not v or now - v[-1] > LOGIN_WINDOW_SEC
++            ]:
++                _attempts.pop(stale, None)
++
++
++def _repo(request: Request) -> TenantRepository:
++    return request.app.state.tenants
++
++
++def _client_key(request: Request, email: str) -> str:
++    client = request.client.host if request.client else "unknown"
++    return f"{client}:{email.strip().lower()}"
++
++
++# ------------------------------------------------------------------ schemas
++
++
++class SignupRequest(BaseModel):
++    organization_name: str = Field(min_length=2, max_length=120)
++    name: str = Field(min_length=1, max_length=120)
++    email: EmailStr
++    password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=256)
++
++
++class LoginRequest(BaseModel):
++    email: EmailStr
++    password: str = Field(min_length=1, max_length=256)
++    # Optional shortcut: a client that already knows which organization the
++    # person wants can skip the chooser entirely.
++    organization_id: Optional[str] = None
++
++
++class OrganizationChoice(BaseModel):
++    organization_id: str
++    organization_name: str
++    role: str
++
++
++class SelectOrganizationRequest(BaseModel):
++    org_select_token: str
++    organization_id: str
++
++
++class AuthenticatedResponse(BaseModel):
++    access_token: str
++    token_type: str = "bearer"
++    expires_in: int
++    user_id: str
++    email: str
++    name: str
++    role: str
++    organization_id: str
++    organization_name: str
++    plan_code: str
++
++
++class ChooseOrganizationResponse(BaseModel):
++    """Returned when the password matched in more than one organization."""
++
++    needs_organization: bool = True
++    org_select_token: str
++    expires_in: int
++    organizations: list[OrganizationChoice]
++
++
++# ------------------------------------------------------------------ helpers
++
++
++async def _authenticated_response(
++    repo: TenantRepository, user: User
++) -> AuthenticatedResponse:
++    organization = await repo.get_organization(user.organization_id)
++    if organization is None:
++        # Only reachable if an organization was deleted with users still
++        # attached. Fail closed rather than issuing a token scoped to nothing.
++        log.error(
++            "user %s references missing organization %s",
++            user.id,
++            user.organization_id,
++        )
++        raise HTTPException(
++            status.HTTP_403_FORBIDDEN,
++            detail="This account's organization is no longer available.",
++        )
++    if organization.status is OrganizationStatus.CLOSED:
++        raise HTTPException(
++            status.HTTP_403_FORBIDDEN,
++            detail="This organization is closed. Contact your administrator.",
++        )
++    if user.status is not UserStatus.ACTIVE:
++        raise HTTPException(
++            status.HTTP_403_FORBIDDEN,
++            detail=f"This account is {user.status.value}. Contact your administrator.",
++        )
++
++    token, ttl = issue_access_token(
++        user_id=user.id,
++        organization_id=user.organization_id,
++        role=user.role.value,
++        email=user.email,
++    )
++    return AuthenticatedResponse(
++        access_token=token,
++        expires_in=ttl,
++        user_id=user.id,
++        email=user.email,
++        name=user.name,
++        role=user.role.value,
++        organization_id=organization.id,
++        organization_name=organization.name,
++        plan_code=organization.plan_code,
++    )
++
++
++# ------------------------------------------------------------------- routes
++
++
++@router.post(
++    "/signup",
++    response_model=AuthenticatedResponse,
++    status_code=status.HTTP_201_CREATED,
++)
++async def signup(request: Request, body: SignupRequest) -> AuthenticatedResponse:
++    """Create a new organization and sign in as its owner.
++
++    Joining an EXISTING organization is not possible here on purpose. If it
++    were, anyone could attach themselves to a customer's tenant by typing its
++    name, and the tenant isolation the rest of the system enforces would have
++    a front door. Members arrive by invitation from an owner.
++    """
++    repo = _repo(request)
++    await _rate_limit(_client_key(request, body.email))
++
++    try:
++        password_hash = hash_password(body.password)
++    except PasswordError as exc:
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
++
++    organization = Organization.create(
++        name=body.organization_name.strip(),
++        status=OrganizationStatus.TRIAL,
++    )
++    owner = User.create(
++        organization_id=organization.id,
++        email=str(body.email),
++        name=body.name.strip(),
++        role=UserRole.OWNER,
++        status=UserStatus.ACTIVE,
++        password_hash=password_hash,
++    )
++
++    try:
++        organization, owner = await repo.create_organization_with_owner(
++            organization, owner
++        )
++    except DuplicateEmailError as exc:
++        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from None
++
++    log.info(
++        "organization created",
++        extra={
++            "event": "signup",
++            "organization_id": organization.id,
++            "user_id": owner.id,
++        },
++    )
++    return await _authenticated_response(repo, owner)
++
++
++@router.post("/login", response_model=None)
++async def login(request: Request, body: LoginRequest):
++    """Verify a password across every organization holding this email."""
++    repo = _repo(request)
++    await _rate_limit(_client_key(request, body.email))
++
++    candidates = await repo.find_users_by_email(str(body.email))
++    if body.organization_id:
++        candidates = [
++            u for u in candidates if u.organization_id == body.organization_id
++        ]
++
++    if not candidates:
++        # Burn the same CPU a real verify would, so an unknown email and a
++        # wrong password are indistinguishable by response time.
++        verify_password(body.password, _TIMING_DECOY)
++        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=GENERIC_LOGIN_FAILURE)
++
++    matched = [u for u in candidates if verify_password(body.password, u.password_hash)]
++
++    if not matched:
++        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=GENERIC_LOGIN_FAILURE)
++
++    if len(matched) == 1:
++        user = matched[0]
++        # Upgrade the stored hash while the plaintext is in hand. This is the
++        # only moment it is available, so without it raising the scrypt cost
++        # parameters would only ever protect accounts created afterwards.
++        if needs_rehash(user.password_hash):
++            user.password_hash = hash_password(body.password)
++            await repo.save_user(user)
++        return await _authenticated_response(repo, user)
++
++    # Same email and same password in several organizations. Ask which one.
++    organizations: list[OrganizationChoice] = []
++    for user in matched:
++        org = await repo.get_organization(user.organization_id)
++        if org is None or org.status is OrganizationStatus.CLOSED:
++            continue
++        organizations.append(
++            OrganizationChoice(
++                organization_id=org.id,
++                organization_name=org.name,
++                role=user.role.value,
++            )
++        )
++    if not organizations:
++        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=GENERIC_LOGIN_FAILURE)
++    if len(organizations) == 1:
++        only = next(
++            u for u in matched if u.organization_id == organizations[0].organization_id
++        )
++        return await _authenticated_response(repo, only)
++
++    token, ttl = issue_org_select_token([u.id for u in matched], str(body.email))
++    return ChooseOrganizationResponse(
++        org_select_token=token,
++        expires_in=ttl,
++        organizations=organizations,
++    )
++
++
++@router.post("/login/organization", response_model=AuthenticatedResponse)
++async def select_organization(
++    request: Request, body: SelectOrganizationRequest
++) -> AuthenticatedResponse:
++    """Finish a login that needed an organization chosen."""
++    repo = _repo(request)
++    try:
++        candidate_ids, _email = read_org_select_token(body.org_select_token)
++    except TokenError as exc:
++        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from None
++
++    # The token pins WHICH user ids the password matched. Resolving the
++    # organization from the request alone would let a valid token be pointed
++    # at an organization whose password was never verified — so the chosen
++    # organization must belong to one of the pinned candidates, and
++    # `get_user` is scoped, meaning a mismatched pair returns None.
++    user: Optional[User] = None
++    for user_id in candidate_ids:
++        user = await repo.get_user(user_id, body.organization_id)
++        if user is not None:
++            break
++
++    if user is None:
++        raise HTTPException(
++            status.HTTP_403_FORBIDDEN,
++            detail="That organization isn't available for this sign-in.",
++        )
++    return await _authenticated_response(repo, user)
++
++
++@router.get("/me", response_model=AuthenticatedResponse)
++async def me(
++    request: Request, authorization: str = Header(default="")
++) -> AuthenticatedResponse:
++    """Re-hydrate a session from a stored token.
++
++    The frontend calls this on load. It re-reads the user from the repository
++    rather than trusting the token's claims, so a role change or a disabled
++    account takes effect on the next page load instead of at token expiry.
++    """
++    scheme, _, raw = authorization.partition(" ")
++    if scheme.lower() != "bearer" or not raw:
++        raise HTTPException(
++            status.HTTP_401_UNAUTHORIZED, detail="Sign in to continue."
++        )
++    try:
++        claims = read_access_token(raw.strip())
++    except TokenError as exc:
++        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from None
++
++    repo = _repo(request)
++    user = await repo.get_user(claims.user_id, claims.organization_id)
++    if user is None:
++        raise HTTPException(
++            status.HTTP_401_UNAUTHORIZED, detail="This account no longer exists."
++        )
++    return await _authenticated_response(repo, user)
+diff --git a/backend/app/api/routes_ws.py b/backend/app/api/routes_ws.py
+index 40f3f64..ac3d625 100644
+--- a/backend/app/api/routes_ws.py
++++ b/backend/app/api/routes_ws.py
+@@ -174,6 +174,16 @@ async def transcribe(ws: WebSocket) -> None:
+ 
+                     if msg.get("bytes") is not None:
+                         await session.feed_audio(msg["bytes"])
++                        if session.limit_reached:
++                            # The plan's per-session ceiling was hit and the
++                            # transcript has already been drained and sent.
++                            # Reading further frames would burn CPU decoding
++                            # audio that is guaranteed to be discarded.
++                            await ws.close(
++                                code=WS_TRY_AGAIN_LATER,
++                                reason="session length limit reached",
++                            )
++                            break
+ 
+                     elif msg.get("text") == "stop":
+                         await session.finish()
+diff --git a/backend/app/asr/gemini_provider.py b/backend/app/asr/gemini_provider.py
+index f579ac1..91ec2fd 100644
+--- a/backend/app/asr/gemini_provider.py
++++ b/backend/app/asr/gemini_provider.py
+@@ -2,12 +2,34 @@
+ gemini_provider.py — Gemini ASR for Sinhala / Tamil / English, including
+ code-switched speech.
+ 
++CHANGES IN THIS REVISION
++------------------------
++1. THE CONTEXT HINT IS NOW CHECKED AGAINST THE OUTPUT. `transcribe_segment`
++   passes `context` down to `_parse`, so `clean_transcript` can tell whether
++   the model transcribed the audio or continued the prompt. Previously the
++   hint was sent and never audited; a model that echoed it produced fluent,
++   correctly-scripted, non-repetitive text describing audio from ten seconds
++   ago, and nothing in the pipeline could see that.
++
++2. A CHARACTER-RATE GUARD SITS BESIDE THE WORD-RATE GUARD. `MAX_WORDS_PER_SEC`
++   barely functions for Sinhala and Tamil: both agglutinate, so a sentence
++   that would be eight English words is three or four tokens. A model looping
++   in Sinhala can emit 400 characters in three seconds and still measure ~2
++   words/sec, well under the 8.0 limit. Characters per second is the scale-free
++   version of the same check.
++
++3. THE LANGUAGE LABEL IS DERIVED FROM THE SCRIPT, NOT TRUSTED. `language` and
++   `text` are produced independently — the response schema constrains the
++   first and cannot constrain the second — so Sinhala-script text labelled
++   `en` is routine. The frontend colours turns by that label, so a wrong label
++   is visible to the user even when the text is perfect.
++
+ LATENCY NOTES (this file is where most of the remaining wall-clock lives)
+ ------------------------------------------------------------------------
+ 1. THINKING IS OFF. Flash-tier models reason before answering by default.
+    Transcription has no reasoning in it — the model is reading audio — so a
+    thinking budget is pure added latency. Setting it to 0 typically removes
+-   400-900 ms per call. This is the single largest ASR-side win available.
++   400-900 ms per call.
+ 
+ 2. THE CLIENT IS BUILT ONCE. Constructing a genai.Client per request
+    re-resolves credentials and re-opens the connection pool.
+@@ -16,7 +38,7 @@ LATENCY NOTES (this file is where most of the remaining wall-clock lives)
+    through Google's global front door, which is fine for throughput and bad
+    for tail latency. From Sri Lanka, asia-south1 (Mumbai) is normally the
+    closest low-latency region; asia-southeast1 (Singapore) is the usual
+-   second choice. Measure both — it is a two-line experiment worth doing.
++   second choice.
+ 
+ 4. THE RESPONSE IS SCHEMA-CONSTRAINED. Asking for JSON in prose and then
+    parsing it invites preambles and markdown fences; a response schema makes
+@@ -25,7 +47,6 @@ LATENCY NOTES (this file is where most of the remaining wall-clock lives)
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+ import io
+ import json
+ import logging
+@@ -33,7 +54,7 @@ import struct
+ from dataclasses import dataclass
+ from typing import Optional
+ 
+-from .validation import clean_transcript
++from .validation import clean_transcript, dominant_language
+ 
+ log = logging.getLogger("voxlive.gemini")
+ 
+@@ -74,13 +95,30 @@ class GeminiProvider:
+         project: str = "",
+         location: str = "asia-south1",
+         max_words_per_sec: float = 8.0,
++        max_chars_per_sec: float = 28.0,
+         thinking_budget: int = 0,
+     ):
+         from google import genai
+ 
+         self.model = model
+-        self.allowed = tuple(allowed_languages)
++        # Anything outside si/ta/en is discarded rather than silently accepted:
++        # the script filter, the prompt and the response enum all derive from
++        # this tuple, so letting an unsupported code through here would quietly
++        # widen all three.
++        self.allowed = tuple(c for c in allowed_languages if c in LANG_NAMES) or (
++            "si",
++            "en",
++            "ta",
++        )
++        if len(self.allowed) != len(tuple(allowed_languages)):
++            log.warning(
++                "ignoring unsupported language codes in ALLOWED_LANGUAGES=%s; "
++                "this build supports only %s",
++                ",".join(allowed_languages),
++                ",".join(sorted(LANG_NAMES)),
++            )
+         self.max_wps = float(max_words_per_sec)
++        self.max_cps = float(max_chars_per_sec)
+         self.thinking_budget = int(thinking_budget)
+ 
+         if use_vertex:
+@@ -118,6 +156,9 @@ class GeminiProvider:
+             "Bengali or any other script. Sinhala is frequently confused with "
+             "Thaana — if audio sounds like an unfamiliar South Asian "
+             "language, it is Sinhala or Tamil, or it is not speech.\n"
++            "2c. The speaker is speaking one of these three languages. If you "
++            "are unsure which, choose between them — never fall back to a "
++            "fourth language, and never output a transliteration.\n"
+             "3. `language` is the language of the MAJORITY of the words. Use "
+             "exactly one of: " + ", ".join(self.allowed) + ".\n"
+             "4. If the audio is silence, noise, breathing or music, return an "
+@@ -139,18 +180,19 @@ class GeminiProvider:
+         parts = [
+             types.Part.from_bytes(data=_wav(pcm, sample_rate), mime_type="audio/wav")
+         ]
+-        if context:
++        hint = context[-1200:] if context else None
++        if hint:
+             # Rolling context materially improves proper nouns and code-switch
+             # boundaries. It is a HINT, and must be fenced as one, or the model
+             # will happily continue the previous sentence instead of
+-            # transcribing the audio.
++            # transcribing the audio. `_parse` now verifies that it didn't.
+             parts.append(
+                 types.Part(
+                     text=(
+                         "Context — the immediately preceding transcript, for "
+                         "vocabulary and spelling consistency ONLY. Do not "
+                         "repeat, continue or transcribe it:\n"
+-                        f"<<<{context[-1200:]}>>>"
++                        f"<<<{hint}>>>"
+                     )
+                 )
+             )
+@@ -182,9 +224,9 @@ class GeminiProvider:
+             config=cfg,
+         )
+ 
+-        return self._parse(resp, len(pcm) / 2 / sample_rate)
++        return self._parse(resp, len(pcm) / 2 / sample_rate, hint)
+ 
+-    def _parse(self, resp, duration: float) -> ASRResult:
++    def _parse(self, resp, duration: float, context: Optional[str]) -> ASRResult:
+         raw = (getattr(resp, "text", "") or "").strip()
+         if not raw:
+             return ASRResult("", self.allowed[0])
+@@ -203,24 +245,35 @@ class GeminiProvider:
+         if not text:
+             return ASRResult("", lang)
+ 
+-        # Guard 1 — RATE. Nobody speaks 8 words a second. A burst well above
+-        # human rate means the model looped on noise. Catches FAST failure.
++        # Guard 1 — RATE. Two measures of the same thing, because neither one
++        # covers all three languages. Words-per-second catches English loops;
++        # Sinhala and Tamil agglutinate, so a runaway Sinhala segment stays
++        # under the word limit while its character count explodes. A segment
++        # only has to trip ONE of them.
+         words = len(text.split())
+-        if duration > 0.4 and words / duration > self.max_wps:
+-            log.info(
+-                "hallucination guard: %d words in %.1fs (%.1f w/s), dropping",
+-                words,
+-                duration,
+-                words / duration,
+-            )
+-            return ASRResult("", lang)
++        chars = sum(1 for ch in text if not ch.isspace())
++        if duration > 0.4:
++            wps = words / duration
++            cps = chars / duration
++            if wps > self.max_wps or cps > self.max_cps:
++                log.info(
++                    "rate guard: %d words / %d chars in %.1fs "
++                    "(%.1f w/s, %.1f c/s), dropping",
++                    words,
++                    chars,
++                    duration,
++                    wps,
++                    cps,
++                    extra={"event": "asr_rate_rejected"},
++                )
++                return ASRResult("", lang)
+ 
+-        # Guard 2 — CONTENT. Catches SLOW failure, which the rate guard cannot
+-        # see: fluent-looking output in a script we never asked for, or a
+-        # phrase repeating like a stuck decoder. `language` being a valid enum
+-        # value says nothing about the characters in `text`, so this is the
+-        # only place the actual script is ever checked.
+-        cleaned, dropped = clean_transcript(text, self.allowed)
++        # Guard 2 — CONTENT. Catches the slow failures the rate guard cannot
++        # see: fluent output in a script we never asked for, a phrase repeating
++        # like a stuck decoder, or the context hint read back to us. `language`
++        # being a valid enum value says nothing about the characters in `text`,
++        # so this is the only place the actual script is ever checked.
++        cleaned, dropped = clean_transcript(text, self.allowed, context)
+         if dropped:
+             log.warning(
+                 "content guard: dropping %.1fs segment (%s)",
+@@ -230,4 +283,18 @@ class GeminiProvider:
+             )
+             return ASRResult("", lang)
+ 
++        # The label is derived from the surviving text rather than taken on
++        # trust. The schema constrains `language` to the enum but cannot make
++        # it agree with `text`, and a mislabelled turn is visible in the UI:
++        # the frontend colours and tags each paragraph by this field.
++        detected = dominant_language(cleaned)
++        if detected and detected in self.allowed and detected != lang:
++            log.info(
++                "language label corrected: model said %s, script says %s",
++                lang,
++                detected,
++                extra={"event": "asr_language_corrected"},
++            )
++            lang = detected
++
+         return ASRResult(cleaned, lang)
+diff --git a/backend/app/asr/validation.py b/backend/app/asr/validation.py
+index 880a256..cf53c57 100644
+--- a/backend/app/asr/validation.py
++++ b/backend/app/asr/validation.py
+@@ -1,8 +1,40 @@
+ """
+ validation.py — content checks on ASR output.
+ 
+-WHY THIS EXISTS
+----------------
++WHAT CHANGED IN THIS REVISION, AND WHY
++--------------------------------------
++The previous version had the drop rule backwards. It dropped on TOKEN COUNT:
++
++    if len(cleaned.split()) < MIN_TOKENS_AFTER_STRIP:   # 3
++        return "", "foreign script ..., nothing usable left"
++
++`MIN_TOKENS_AFTER_STRIP` was written to mean "too little survived the strip to
++trust", but it was applied to text that had never been stripped at all. The
++measured consequence:
++
++    'ඔව්'       -> dropped   ("foreign script 0%, nothing usable left")
++    'හරි'       -> dropped
++    'thank you' -> dropped
++    'ஆம் சரி'   -> dropped
++    'ok ok ok ok ok ok ok' -> KEPT
++
++Every one- and two-word turn was silently deleted while a seven-token decoder
++loop passed. In live Sinhala/Tamil conversation short answers are a large
++share of all turns, so this was removing real speech continuously and only
++ever surfacing in the logs as a foreign-script warning.
++
++The rule is now conditional on CONTAMINATION, not on length:
++
++    * nothing survived the strip                     -> drop
++    * most of the text was foreign AND the remnant
++      is too short to stand on its own               -> drop
++    * otherwise                                      -> keep what survived
++
++A clean short utterance has a foreign share of 0.0, so it is never eligible
++for the second branch and is always kept.
++
++THE ORIGINAL FAILURE THIS MODULE EXISTS FOR
++-------------------------------------------
+ A real transcript from this system contained a paragraph labelled `si`
+ (Sinhala) whose characters measured:
+ 
+@@ -11,8 +43,8 @@ A real transcript from this system contained a paragraph labelled `si`
+     Arabic      7 chars    1.5%
+     Kannada     5 chars    1.1%
+ 
+-Every guard in the pipeline passed it, because each one was checking the
+-wrong thing:
++Every guard in the pipeline passed it, because each was checking the wrong
++thing:
+ 
+   ALLOWED_LANGUAGES     `state.py` checks `result.language not in allowed`.
+                         The model returned "si". That is a LABEL check; it
+@@ -22,48 +54,31 @@ wrong thing:
+                         unconstrained STRING — no JSON schema can restrict
+                         which script a string is written in.
+ 
+-  MAX_WORDS_PER_SEC     The whole paragraph is ~3.3 words/sec over 33 s; the
+-                        Thaana burst alone is ~5 w/s in a 9 s segment. Both
+-                        are far under the 8.0 limit. That guard catches FAST
+-                        hallucination (a model looping on noise); this one is
+-                        slow and fluent, so the guard could never fire.
+-
+-So there was no check on the characters themselves. That is what this module
+-adds.
+-
+-WHY THE MODEL DID IT
+---------------------
+-The garbage is a textbook degenerate decoding loop — the token `ހކއހވ`
+-appears 7 times and a ~12-token phrase repeats nearly verbatim 4 times. The
+-model lost the audio and started generating from its own prior. Contributing
+-factors, in rough order of importance:
+-
+-  1. No script constraint existed, so nothing pushed back.
+-  2. Sinhala and Thaana are both low-resource South Asian scripts. On unclear
+-     or noisy Sinhala the audio encoder has weak separation between them.
+-  3. The segment that produced it ended on `max_len` (9 s), not on a natural
+-     pause — the longest, least-bounded input the pipeline can produce.
+-  4. `temperature=0.0`. Greedy decoding is MORE prone to repetition loops
+-     than low-temperature sampling, not less. This is counter-intuitive and
+-     worth testing separately.
+-
+-TWO CHECKS, IN ORDER
+---------------------
+-    1. SCRIPT      Strip tokens written in a script we did not ask for.
+-                   Drop the segment entirely if most of it was foreign.
+-    2. REPETITION  Drop text that repeats itself like a stuck decoder —
+-                   this also catches loops that stay in Sinhala script.
+-
+-Measured on the real sample: real speech has a unique-token ratio of 0.82 and
+-a top 3-gram repeated twice; the hallucination scores 0.33 and 4. The
+-thresholds below sit between those, well clear of both.
++  MAX_WORDS_PER_SEC     The paragraph is ~3.3 words/sec over 33 s. That guard
++                        catches FAST hallucination (a model looping on noise);
++                        this one was slow and fluent, so it could never fire.
++
++FOUR CHECKS, IN ORDER
++---------------------
++    1. SCRIPT       Strip tokens written in a script we did not ask for.
++    2. RUN          Drop text containing an immediate run of one repeated
++                    token — the shortest, most obvious decoder loop, and the
++                    one the n-gram check below is too coarse to see.
++    3. REPETITION   Drop text that repeats itself across a longer window.
++    4. ECHO         Drop text that is mostly a copy of the rolling context we
++                    sent as a hint. The model continued the prompt instead of
++                    reading the audio.
++
++Checks 2 and 4 are new. Check 4 closes a gap the README already claimed was
++closed: there was no context-echo guard anywhere in the pipeline, only an
++exact-match comparison against the single previous segment in `state.py`.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+ from collections import Counter
+-from typing import Iterable
++from typing import Iterable, Optional
+ 
+ log = logging.getLogger("voxlive.asr.validation")
+ 
+@@ -97,27 +112,39 @@ NEUTRAL_CODEPOINTS = frozenset(
+ # does not delete the word.
+ TOKEN_FOREIGN_RATIO = 0.5
+ 
+-# Foreign tokens are ALWAYS removed — they are definitionally wrong, so
+-# keeping the remainder cannot reintroduce garbage. The segment is therefore
+-# dropped only when nothing usable survives, not because the foreign SHARE
+-# was high. An earlier version dropped anything above 60% foreign; measured
+-# against the real sample that discarded 34 tokens of clean Sinhala (unique
+-# ratio 1.0, zero foreign characters) alongside the garbage. Losing real
+-# speech is the worse failure.
+-MIN_TOKENS_AFTER_STRIP = 3
++# Drop the whole segment only when the text was BADLY contaminated and what
++# survived is too short to stand on its own. BOTH conditions are required.
++# A clean segment has foreign_share == 0.0 and can never reach this branch,
++# which is precisely the bug this replaced.
++HEAVY_CONTAMINATION_SHARE = 0.5
++MIN_TOKENS_AFTER_HEAVY_STRIP = 3
+ 
+ # Above this share, log at WARNING rather than INFO. Not a drop trigger — a
+ # monitoring signal. A rising foreign-script rate is the earliest evidence
+-# that the model, the region or the audio quality has degraded, and it is
+-# far more useful as a metric than as a silent deletion.
++# that the model, the region or the audio quality has degraded.
+ FOREIGN_SHARE_ALARM = 0.25
+ 
+-# Repetition. Only applied once there are enough tokens for the ratio to mean
+-# something; short utterances legitimately repeat ("ලණු කන්න එපා").
++# --- repetition -------------------------------------------------------------
++# An immediate run of the SAME token. Catches "ok ok ok ok" and
++# "හරි හරි හරි හරි", which the 3-gram check cannot see because it needs 12
++# tokens before it will look at anything. Four is deliberately conservative:
++# natural speech repeats a word twice for emphasis and occasionally three
++# times, but four identical tokens in a row is a decoder loop.
++MAX_TOKEN_RUN = 4
++
++# Longer-window repetition. Only applied once there are enough tokens for the
++# ratio to mean something; short utterances legitimately repeat.
+ REPETITION_MIN_TOKENS = 12
+ REPETITION_UNIQUE_RATIO = 0.45  # real speech measured 0.82, garbage 0.33
+ REPETITION_MAX_NGRAM_REPEATS = 3  # real speech 2, garbage 4
+ 
++# --- context echo -----------------------------------------------------------
++# The provider sends recent transcript as a spelling hint. When the model
++# loses the audio it sometimes continues that hint instead. Measured as the
++# share of the output's 3-grams that already appear in the context.
++ECHO_MIN_TOKENS = 5
++ECHO_CONTAINMENT = 0.80
++
+ 
+ def _is_neutral(ch: str) -> bool:
+     """Digits, punctuation, spaces and joiners carry no script information."""
+@@ -158,6 +185,31 @@ def script_profile(text: str, ranges: Iterable[tuple[int, int]]) -> tuple[int, i
+     return allowed, foreign
+ 
+ 
++def dominant_language(text: str) -> Optional[str]:
++    """Which of si / ta / en the text is mostly written in, or None.
++
++    Used to CORRECT the model's own `language` label. The label and the text
++    are produced independently — the response schema constrains one and not
++    the other — so a Sinhala-script paragraph labelled `en` is a routine
++    outcome, and the frontend colours turns by that label.
++    """
++    counts: dict[str, int] = {}
++    for code, ranges in SCRIPT_RANGES.items():
++        counts[code] = sum(
++            1 for ch in text if not _is_neutral(ch) and _in_ranges(ch, ranges)
++        )
++    total = sum(counts.values())
++    if total == 0:
++        return None
++    # Sinhala and Tamil beat Latin on ties: a code-switched Sinhala sentence
++    # carrying two English brand names is a Sinhala turn, not an English one.
++    for code in ("si", "ta"):
++        if counts[code] and counts[code] >= counts["en"]:
++            return code
++    best = max(counts, key=lambda c: counts[c])
++    return best if counts[best] else None
++
++
+ def strip_foreign_scripts(
+     text: str, ranges: Iterable[tuple[int, int]]
+ ) -> tuple[str, float]:
+@@ -187,16 +239,38 @@ def strip_foreign_scripts(
+     return " ".join(kept), share
+ 
+ 
++def longest_token_run(tokens: list[str]) -> int:
++    """Length of the longest run of consecutive identical tokens."""
++    best = run = 0
++    previous: Optional[str] = None
++    for token in tokens:
++        key = token.strip(".,!?…:;").casefold()
++        if key and key == previous:
++            run += 1
++        else:
++            run = 1
++            previous = key
++        best = max(best, run)
++    return best
++
++
+ def looks_degenerate(text: str) -> bool:
+     """True when the text repeats itself like a stuck decoder.
+ 
+     Catches loops that stay INSIDE an allowed script, which the script filter
+-    cannot see. Two independent signals, either of which is enough:
++    cannot see. Three independent signals, any of which is enough:
+ 
++      * an immediate run of one token — the shortest possible loop
+       * low unique-token ratio — the model is cycling a small vocabulary
+       * one 3-gram appearing many times — the model is cycling a phrase
+     """
+     tokens = text.split()
++    if not tokens:
++        return False
++
++    if longest_token_run(tokens) >= MAX_TOKEN_RUN:
++        return True
++
+     if len(tokens) < REPETITION_MIN_TOKENS:
+         return False
+ 
+@@ -210,7 +284,51 @@ def looks_degenerate(text: str) -> bool:
+     return False
+ 
+ 
+-def clean_transcript(text: str, languages: Iterable[str]) -> tuple[str, str | None]:
++def echoes_context(text: str, context: Optional[str]) -> bool:
++    """True when the output is mostly a copy of the context hint.
++
++    The provider sends recent transcript so the model spells names
++    consistently. A model that has lost the audio will sometimes transcribe
++    that hint instead — producing fluent, correct-looking text that describes
++    audio from ten seconds ago. Nothing else in the pipeline can see this:
++    the script is right, the language is right, and it does not repeat itself.
++
++    Containment rather than similarity, because the echo is usually a SUBSET
++    of the context, not the whole of it.
++    """
++    if not context:
++        return False
++
++    tokens = text.split()
++    if len(tokens) < ECHO_MIN_TOKENS:
++        # Short confirmations legitimately recur across turns. Dropping "හරි"
++        # because it appeared thirty seconds ago is the same class of mistake
++        # this module was rewritten to remove.
++        return False
++
++    ctx_tokens = context.split()
++    if len(ctx_tokens) < 3:
++        return False
++
++    ctx_grams = {
++        tuple(t.casefold() for t in ctx_tokens[i : i + 3])
++        for i in range(len(ctx_tokens) - 2)
++    }
++    grams = [
++        tuple(t.casefold() for t in tokens[i : i + 3]) for i in range(len(tokens) - 2)
++    ]
++    if not grams:
++        return False
++
++    contained = sum(1 for g in grams if g in ctx_grams) / len(grams)
++    return contained >= ECHO_CONTAINMENT
++
++
++def clean_transcript(
++    text: str,
++    languages: Iterable[str],
++    context: Optional[str] = None,
++) -> tuple[str, str | None]:
+     """Validate one ASR result.
+ 
+     Returns `(cleaned_text, reason_if_dropped)`. An empty string with a reason
+@@ -222,13 +340,26 @@ def clean_transcript(text: str, languages: Iterable[str]) -> tuple[str, str | No
+ 
+     ranges = allowed_ranges(languages)
+     cleaned, foreign_share = strip_foreign_scripts(text, ranges)
++    tokens = cleaned.split()
+ 
+-    if len(cleaned.split()) < MIN_TOKENS_AFTER_STRIP:
+-        return "", f"foreign script {foreign_share:.0%}, nothing usable left"
++    if not tokens:
++        return "", f"foreign script {foreign_share:.0%}, nothing survived"
++
++    # Only heavy contamination justifies discarding the remainder. A clean
++    # segment has foreign_share == 0.0 and never reaches this branch, however
++    # short it is.
++    if (
++        foreign_share >= HEAVY_CONTAMINATION_SHARE
++        and len(tokens) < MIN_TOKENS_AFTER_HEAVY_STRIP
++    ):
++        return "", f"foreign script {foreign_share:.0%}, remnant too short to trust"
+ 
+     if looks_degenerate(cleaned):
+         return "", "repetition loop"
+ 
++    if echoes_context(cleaned, context):
++        return "", "echoed the context hint instead of the audio"
++
+     if foreign_share > 0:
+         log.log(
+             logging.WARNING if foreign_share > FOREIGN_SHARE_ALARM else logging.INFO,
+diff --git a/backend/app/auth/passwords.py b/backend/app/auth/passwords.py
+new file mode 100644
+index 0000000..3be1c30
+--- /dev/null
++++ b/backend/app/auth/passwords.py
+@@ -0,0 +1,144 @@
++"""
++passwords.py — password hashing.
++
++WHY scrypt AND NOT bcrypt OR argon2
++-----------------------------------
++`hashlib.scrypt` is in the Python standard library and is backed by OpenSSL,
++which is already in the container because Python links against it. bcrypt and
++argon2-cffi both pull a compiled extension, which means either a manylinux
++wheel or a C toolchain in the image. On a Fargate task that costs image size
++and cold-start time on every deploy and every scale-out event, for a
++primitive the standard library already provides at equivalent strength.
++
++scrypt is memory-hard, which is the property that matters: it is what makes a
++GPU attack expensive rather than merely parallel.
++
++PARAMETERS
++----------
++    n = 2**14 (16384), r = 8, p = 1
++
++That is the RFC 7914 "interactive login" set, roughly 16 MB and ~50-80 ms per
++hash on a Fargate vCPU. Two consequences to be deliberate about:
++
++  * OpenSSL enforces `maxmem`, and its default is 32 MB. n=2**15 needs ~32 MB
++    and fails intermittently. `maxmem` is set explicitly below so the limit is
++    a decision rather than a surprise.
++
++  * ~60 ms is a real cost under a login storm. It is also the entire point.
++    Rate limiting belongs in front of the endpoint, not in a weaker hash.
++
++STORAGE FORMAT
++--------------
++    scrypt$<n>$<r>$<p>$<salt_b64>$<hash_b64>
++
++The parameters travel with the hash, so raising n later does not invalidate
++existing passwords: old hashes keep verifying with their own parameters, and
++`needs_rehash` tells the login path when to transparently upgrade one.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import hmac
++import os
++
++_ALGORITHM = "scrypt"
++_N = 2**14
++_R = 8
++_P = 1
++_DKLEN = 32
++_SALT_BYTES = 16
++# n * r * 128 * 2 with headroom. OpenSSL's default of 32 MB is too tight to
++# leave implicit.
++_MAXMEM = 64 * 1024 * 1024
++
++# Minimum length only. Composition rules (one digit, one symbol) push people
++# toward "Password1!" and are worse than length for real-world strength.
++MIN_PASSWORD_LENGTH = 10
++MAX_PASSWORD_LENGTH = 256  # a hashing-cost DoS bound, not a security rule
++
++
++class PasswordError(ValueError):
++    """The supplied password is not acceptable."""
++
++
++def _b64(raw: bytes) -> str:
++    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
++
++
++def _unb64(text: str) -> bytes:
++    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
++
++
++def validate_password(password: str) -> None:
++    """Raise PasswordError if the password cannot be used. No return value."""
++    if not isinstance(password, str) or not password:
++        raise PasswordError("Enter a password.")
++    if len(password) < MIN_PASSWORD_LENGTH:
++        raise PasswordError(
++            f"Use at least {MIN_PASSWORD_LENGTH} characters. "
++            "Length matters more than symbols."
++        )
++    if len(password) > MAX_PASSWORD_LENGTH:
++        raise PasswordError(f"Keep it under {MAX_PASSWORD_LENGTH} characters.")
++
++
++def hash_password(password: str) -> str:
++    """Hash a password for storage. Validates first."""
++    validate_password(password)
++    salt = os.urandom(_SALT_BYTES)
++    digest = hashlib.scrypt(
++        password.encode("utf-8"),
++        salt=salt,
++        n=_N,
++        r=_R,
++        p=_P,
++        dklen=_DKLEN,
++        maxmem=_MAXMEM,
++    )
++    return f"{_ALGORITHM}${_N}${_R}${_P}${_b64(salt)}${_b64(digest)}"
++
++
++def verify_password(password: str, encoded: str | None) -> bool:
++    """Constant-time check of a password against a stored hash.
++
++    Returns False rather than raising on a malformed or missing hash. A user
++    row with no password (an invited user who has not set one) must fail the
++    same way and in the same time as a wrong password, or the difference is an
++    account-enumeration oracle.
++    """
++    if not encoded or not password:
++        return False
++    try:
++        algorithm, n, r, p, salt_b64, hash_b64 = encoded.split("$")
++        if algorithm != _ALGORITHM:
++            return False
++        digest = hashlib.scrypt(
++            password.encode("utf-8"),
++            salt=_unb64(salt_b64),
++            n=int(n),
++            r=int(r),
++            p=int(p),
++            dklen=len(_unb64(hash_b64)),
++            maxmem=_MAXMEM,
++        )
++    except (ValueError, TypeError, MemoryError):
++        return False
++    return hmac.compare_digest(digest, _unb64(hash_b64))
++
++
++def needs_rehash(encoded: str | None) -> bool:
++    """True when a stored hash uses weaker parameters than the current ones.
++
++    Call this after a SUCCESSFUL verify — that is the only moment the plaintext
++    is available to re-hash with. Without it, raising `_N` only ever protects
++    accounts created after the change.
++    """
++    if not encoded:
++        return False
++    try:
++        algorithm, n, r, p, _, _ = encoded.split("$")
++    except ValueError:
++        return True
++    return (algorithm, int(n), int(r), int(p)) != (_ALGORITHM, _N, _R, _P)
+diff --git a/backend/app/auth/principal.py b/backend/app/auth/principal.py
+index 267c954..0d587b5 100644
+--- a/backend/app/auth/principal.py
++++ b/backend/app/auth/principal.py
+@@ -3,29 +3,36 @@ principal.py — turning an incoming connection into a TenantContext.
+ 
+     connection ──► PrincipalResolver ──► TenantContext | AuthenticationError
+ 
+-This is the seam Cognito plugs into (the supervisor's step C). Today there are
+-two implementations:
++Three implementations:
+ 
+-    DevPrincipalResolver       development only, trusts query parameters
+-    CognitoPrincipalResolver   the next commit — verifies a JWT against JWKS
++    DevPrincipalResolver     development only, trusts query parameters
++    LocalPrincipalResolver   verifies an HS256 token minted by routes_auth
++    CognitoPrincipalResolver not written — the seam it would occupy is
++                             `build_resolver`, and nothing else changes
+ 
+ THE FAIL-CLOSED RULE
+ --------------------
+-The supervisor's §5 is unambiguous: the backend must refuse ORG_002 data, and
+-the check happens server-side. A resolver that trusts `?organization_id=` from
+-the client is the exact opposite of that — it is not authentication, it is the
+-client telling you who it would like to be.
+-
+-So `DevPrincipalResolver` REFUSES TO CONSTRUCT outside development. Not a
+-warning, not a config flag that defaults to on — a hard `RuntimeError` at
+-start-up. `build_resolver()` in staging or production returns the Cognito
+-resolver or raises.
+-
+-The consequence is deliberate: until the Cognito commit lands,
+-`APP_ENV=production` cannot serve WebSocket traffic at all. That is the
+-correct failure mode. A system that accepts anonymous connections in
+-production because auth "isn't done yet" is how tenant data leaks, and the
+-window between "deployed" and "auth finished" is exactly when it happens.
++A resolver that trusts `?organization_id=` from the client is not
++authentication — it is the client telling you who it would like to be. So
++`DevPrincipalResolver` REFUSES TO CONSTRUCT outside development: a hard
++`RuntimeError` at start-up, not a warning and not a config flag.
++
++WHAT CHANGED
++------------
++`build_resolver` previously raised outside development, which meant
++`APP_ENV=production` could not serve WebSocket traffic at all. That was the
++correct failure mode while no real resolver existed. `LocalPrincipalResolver`
++now fills it, and the fail-closed behaviour moves to the signing secret:
++without `AUTH_JWT_SECRET`, token verification raises at start-up rather than
++falling back to an ephemeral key.
++
++WHY THE ROLE CHECK IS NOT HERE
++------------------------------
++Organization status and user status are AUTHENTICATION concerns: a suspended
++tenant or a disabled account should not get a context at all. Role is not — a
++VIEWER authenticates successfully and is refused at the action. Collapsing the
++two would report "who are you?" for what is really "you may not do that", and
++would make this resolver unusable for read-only transcript routes.
+ """
+ 
+ from __future__ import annotations
+@@ -37,6 +44,7 @@ from typing import Optional
+ from ..tenant.models import Organization, User, UserStatus
+ from ..tenant.repository import TenantRepository
+ from .context import TenantContext
++from .tokens import TokenError, read_access_token, require_signing_secret
+ 
+ log = logging.getLogger("voxlive.auth")
+ 
+@@ -55,14 +63,71 @@ class PrincipalResolver(ABC):
+         """Return the authenticated context, or raise AuthenticationError."""
+ 
+ 
++async def _context_for(
++    repo: TenantRepository, user_id: str, organization_id: str
++) -> TenantContext:
++    """Shared tail of every resolver: load, check status, build the context.
++
++    The user is re-read from the repository on every connection rather than
++    reconstructed from token claims. A token is valid for hours; an account
++    disabled ten minutes ago must not be able to open a new session with it.
++    """
++    organization: Optional[Organization] = await repo.get_organization(organization_id)
++    if organization is None:
++        raise AuthenticationError("unknown organization")
++
++    # Organization-scoped: a user id from another tenant returns None.
++    user: Optional[User] = await repo.get_user(user_id, organization_id)
++    if user is None:
++        raise AuthenticationError("unknown user for this organization")
++
++    if not organization.can_start_sessions:
++        raise AuthorizationError(f"organization is {organization.status.value}")
++    if user.status is not UserStatus.ACTIVE:
++        raise AuthorizationError(f"user account is {user.status.value}")
++
++    return TenantContext.from_records(organization, user)
++
++
++class LocalPrincipalResolver(PrincipalResolver):
++    """Verifies the signed token issued by `POST /auth/login`.
++
++    The token arrives as `?token=` because a browser's WebSocket API cannot
++    set an Authorization header. That places a credential in a URL, with two
++    deployment consequences that are requirements rather than hardening:
++
++      * the token TTL must stay short (AUTH_ACCESS_TTL_SEC), because URLs
++        reach browser history, proxy logs and referrer headers
++      * ALB access logging must not record query strings
++
++    Query-parameter identity hints are IGNORED here. If they were read as a
++    fallback the endpoint would silently accept unauthenticated connections
++    the moment a token failed to parse, which is the exact failure this class
++    exists to remove.
++    """
++
++    def __init__(self, repo: TenantRepository):
++        self.repo = repo
++
++    async def resolve(self, token: Optional[str], **hints) -> TenantContext:
++        if not token:
++            raise AuthenticationError("sign in to start a session")
++        try:
++            claims = read_access_token(token)
++        except TokenError as exc:
++            raise AuthenticationError(str(exc)) from None
++        return await _context_for(self.repo, claims.user_id, claims.organization_id)
++
++
+ class DevPrincipalResolver(PrincipalResolver):
+     """Development-only resolver. NEVER usable outside APP_ENV=development.
+ 
+-    Accepts `?organization_id=&user_id=` so the React frontend and the load
+-    harness can exercise tenant-aware code paths before Cognito exists. It
+-    still goes through the repository, so an unknown organization or a user
+-    from the wrong organization is refused — the isolation logic under test is
+-    the real one, only the identity assertion is fake.
++    Accepts a real token if one is supplied, and falls back to
++    `?organization_id=&user_id=` so the load harness can exercise
++    tenant-aware code paths without a login. It still goes through the
++    repository, so an unknown organization or a user from the wrong
++    organization is refused — the isolation logic under test is the real one,
++    only the identity assertion is fake.
+     """
+ 
+     def __init__(self, repo: TenantRepository, app_env: str):
+@@ -70,54 +135,38 @@ class DevPrincipalResolver(PrincipalResolver):
+             raise RuntimeError(
+                 f"DevPrincipalResolver refused to start under APP_ENV={app_env!r}. "
+                 "It trusts client-supplied identity and must never run outside "
+-                "development. Configure Cognito for staging/production."
++                "development."
+             )
+         self.repo = repo
++        self._real = LocalPrincipalResolver(repo)
+         log.warning(
+-            "AUTH IS IN DEVELOPMENT MODE — identity is taken from query "
+-            "parameters and is NOT verified. Never deploy this."
++            "AUTH IS IN DEVELOPMENT MODE — a connection without a token may "
++            "assert its own identity via query parameters. Never deploy this."
+         )
+ 
+     async def resolve(self, token: Optional[str], **hints) -> TenantContext:
++        if token:
++            return await self._real.resolve(token, **hints)
++
+         organization_id = hints.get("organization_id")
+         user_id = hints.get("user_id")
+         if not organization_id or not user_id:
+             raise AuthenticationError(
+-                "development auth requires ?organization_id= and ?user_id="
++                "sign in, or supply ?organization_id= and ?user_id= in development"
+             )
+-
+-        organization: Optional[Organization] = await self.repo.get_organization(
+-            organization_id
+-        )
+-        if organization is None:
+-            raise AuthenticationError("unknown organization")
+-
+-        # Organization-scoped: a user id from another tenant returns None.
+-        user: Optional[User] = await self.repo.get_user(user_id, organization_id)
+-        if user is None:
+-            raise AuthenticationError("unknown user for this organization")
+-
+-        # Organization status and user status are AUTHENTICATION concerns: a
+-        # suspended tenant or a disabled account should not get a context at
+-        # all. Role is NOT checked here — a VIEWER authenticates successfully
+-        # and is refused at the action. Collapsing the two would make this
+-        # resolver unusable for the read-only transcript routes in §38, and
+-        # would report "who are you?" for what is really "you may not do that".
+-        if not organization.can_start_sessions:
+-            raise AuthorizationError(f"organization is {organization.status.value}")
+-        if user.status is not UserStatus.ACTIVE:
+-            raise AuthorizationError(f"user account is {user.status.value}")
+-
+-        return TenantContext.from_records(organization, user)
++        return await _context_for(self.repo, user_id, organization_id)
+ 
+ 
+ def build_resolver(repo: TenantRepository, app_env: str) -> PrincipalResolver:
+     """Choose a resolver for this environment. Fails closed."""
+     if app_env == "development":
+         return DevPrincipalResolver(repo, app_env)
+-    raise RuntimeError(
+-        f"no production-grade PrincipalResolver is configured for "
+-        f"APP_ENV={app_env!r}. Implement CognitoPrincipalResolver "
+-        "(auth/cognito.py) before deploying. Refusing to start rather than "
+-        "serving unauthenticated tenant traffic."
+-    )
++
++    # Check the signing secret at start-up, against the app_env we were
++    # HANDED rather than the one in the environment. This raises outside
++    # development when AUTH_JWT_SECRET is unset, and it is much better for
++    # that to happen here — where ECS reports a failed task and holds the old
++    # one in service — than on the first user's first connection.
++    require_signing_secret(app_env)
++    log.info("auth: local HS256 tokens (APP_ENV=%s)", app_env)
++    return LocalPrincipalResolver(repo)
+diff --git a/backend/app/auth/tokens.py b/backend/app/auth/tokens.py
+new file mode 100644
+index 0000000..2798a3e
+--- /dev/null
++++ b/backend/app/auth/tokens.py
+@@ -0,0 +1,208 @@
++"""
++tokens.py — signed session tokens.
++
++WHY NOT COGNITO
++---------------
++Cognito's free tier would cover this workload, so the argument is not the
++line item. It is that Cognito adds a SECOND source of truth for users beside
++the `users` table that already exists here, and the two have to be kept in
++step: a signup writes to both, a deletion has to delete from both, and the
++`users.cognito_sub` column exists purely to bridge them. It also puts a JWKS
++fetch and a key-rotation path in the WebSocket accept path.
++
++For a handful of organizations, HS256 tokens signed against the same database
++that already holds the users is less code, no extra service, and one place
++where a user exists. The cost of that choice is real and worth naming:
++
++  * No managed MFA, no hosted password reset, no social login. Each is work
++    you would otherwise get for free.
++  * The signing secret is yours to rotate and to keep out of logs.
++
++If MFA or SSO becomes a requirement, swap this for CognitoPrincipalResolver.
++`build_resolver()` is the only place that would change, which is why the
++resolver seam was built before either implementation existed.
++
++TWO TOKEN KINDS
++---------------
++    access      Identifies a user within one organization. Sent on every
++                WebSocket connection as ?token=. Short-lived, because a
++                WebSocket URL ends up in browser history, proxy logs and ALB
++                access logs unless those are explicitly configured not to
++                record query strings.
++
++    org_select  Issued only when one email plus password matches users in
++                MORE THAN ONE organization. Proves the password was already
++                verified, so the chooser step does not ask for it twice. Very
++                short-lived and useless for anything else: it carries no
++                organization_id, so `resolve()` rejects it.
++"""
++
++from __future__ import annotations
++
++import os
++import time
++from dataclasses import dataclass
++from typing import Optional
++
++import jwt  # PyJWT
++
++ALGORITHM = "HS256"
++ISSUER = "voxlive"
++
++ACCESS_TTL_SEC = int(os.getenv("AUTH_ACCESS_TTL_SEC", str(12 * 3600)))
++# Long enough to survive a chooser screen and a slow connection, short enough
++# that a leaked one is worthless.
++ORG_SELECT_TTL_SEC = int(os.getenv("AUTH_ORG_SELECT_TTL_SEC", "300"))
++
++
++class TokenError(Exception):
++    """The token is missing, malformed, expired or not the kind expected."""
++
++
++@dataclass(frozen=True)
++class AccessClaims:
++    user_id: str
++    organization_id: str
++    role: str
++    email: str
++    expires_at: float
++
++
++def require_signing_secret(app_env: str) -> None:
++    """Start-up gate. Raises unless a usable signing key exists for `app_env`.
++
++    Called by `build_resolver`, which is handed the SAME `app_env` value the
++    rest of the application was configured with. That parameter is the whole
++    point: `_secret()` below re-reads `APP_ENV` from the environment, and if
++    the two ever disagree — a test, a script, an entrypoint that sets one and
++    not the other — the environment read wins and silently downgrades a
++    production process to an ephemeral development key. Passing the value in
++    explicitly makes the gate agree with the caller by construction instead of
++    by coincidence.
++    """
++    _resolve_secret(app_env)
++
++
++def _secret() -> str:
++    """The HS256 signing key, for the request path.
++
++    Read on every call rather than cached at import, so a rotation that
++    restarts the process picks up the new value without a code path that
++    remembers the old one.
++    """
++    return _resolve_secret(os.getenv("APP_ENV", "development").strip().lower())
++
++
++def _resolve_secret(app_env: str) -> str:
++    """Shared body. Absent in development, a stable per-process value is
++    generated: every restart invalidates existing tokens, which is annoying on
++    a laptop and correct everywhere else.
++    """
++    secret = os.getenv("AUTH_JWT_SECRET", "").strip()
++    if secret:
++        if len(secret) < 32:
++            raise RuntimeError(
++                "AUTH_JWT_SECRET is shorter than 32 characters. Generate one "
++                "with: python -c \"import secrets;print(secrets.token_urlsafe(48))\""
++            )
++        return secret
++
++    if app_env != "development":
++        raise RuntimeError(
++            f"AUTH_JWT_SECRET is required under APP_ENV={app_env!r}. Refusing "
++            "to sign tokens with an ephemeral key: every task would sign with "
++            "a different one, so a token minted by task A would be rejected "
++            "by task B and logins would fail at random behind the load "
++            "balancer."
++        )
++    return _dev_secret()
++
++
++_DEV_SECRET: Optional[str] = None
++
++
++def _dev_secret() -> str:
++    global _DEV_SECRET
++    if _DEV_SECRET is None:
++        import secrets
++
++        _DEV_SECRET = secrets.token_urlsafe(48)
++    return _DEV_SECRET
++
++
++def issue_access_token(
++    user_id: str, organization_id: str, role: str, email: str
++) -> tuple[str, int]:
++    """Return `(token, expires_in_seconds)` for an authenticated user."""
++    now = int(time.time())
++    payload = {
++        "iss": ISSUER,
++        "typ": "access",
++        "sub": user_id,
++        "org": organization_id,
++        "role": role,
++        "email": email,
++        "iat": now,
++        "exp": now + ACCESS_TTL_SEC,
++    }
++    return jwt.encode(payload, _secret(), algorithm=ALGORITHM), ACCESS_TTL_SEC
++
++
++def issue_org_select_token(user_ids: list[str], email: str) -> tuple[str, int]:
++    """Prove a password was verified, without naming an organization yet."""
++    now = int(time.time())
++    payload = {
++        "iss": ISSUER,
++        "typ": "org_select",
++        "email": email,
++        "candidates": list(user_ids),
++        "iat": now,
++        "exp": now + ORG_SELECT_TTL_SEC,
++    }
++    return jwt.encode(payload, _secret(), algorithm=ALGORITHM), ORG_SELECT_TTL_SEC
++
++
++def _decode(token: str, expected_type: str) -> dict:
++    if not token:
++        raise TokenError("no token supplied")
++    try:
++        payload = jwt.decode(
++            token,
++            _secret(),
++            algorithms=[ALGORITHM],  # a list, never None: `alg: none` is a bypass
++            issuer=ISSUER,
++            options={"require": ["exp", "iat", "iss"]},
++        )
++    except jwt.ExpiredSignatureError:
++        raise TokenError("session expired, sign in again") from None
++    except jwt.InvalidTokenError as exc:
++        raise TokenError(f"invalid token: {exc}") from None
++
++    if payload.get("typ") != expected_type:
++        # Without this, an org_select token — issued BEFORE an organization is
++        # chosen — would be accepted as an access token.
++        raise TokenError("token is not valid for this operation")
++    return payload
++
++
++def read_access_token(token: str) -> AccessClaims:
++    payload = _decode(token, "access")
++    for field in ("sub", "org", "role"):
++        if not payload.get(field):
++            raise TokenError("token is missing required claims")
++    return AccessClaims(
++        user_id=payload["sub"],
++        organization_id=payload["org"],
++        role=payload["role"],
++        email=payload.get("email", ""),
++        expires_at=float(payload["exp"]),
++    )
++
++
++def read_org_select_token(token: str) -> tuple[list[str], str]:
++    """Return `(candidate_user_ids, email)` from a chooser token."""
++    payload = _decode(token, "org_select")
++    candidates = payload.get("candidates") or []
++    if not isinstance(candidates, list) or not candidates:
++        raise TokenError("token is missing required claims")
++    return [str(c) for c in candidates], str(payload.get("email", ""))
+diff --git a/backend/app/config/base.py b/backend/app/config/base.py
+index 607a935..0143e71 100644
+--- a/backend/app/config/base.py
++++ b/backend/app/config/base.py
+@@ -76,6 +76,10 @@ class Settings:
+     # ---- anti-hallucination guards ----
+     min_segment_rms: int = int(os.getenv("MIN_SEGMENT_RMS", "120"))
+     max_words_per_sec: float = float(os.getenv("MAX_WORDS_PER_SEC", "8.0"))
++    # Companion to MAX_WORDS_PER_SEC. Sinhala and Tamil agglutinate, so a
++    # runaway segment in either stays well under the WORD limit while its
++    # character count explodes. ~28 c/s is roughly double a fast speaker.
++    max_chars_per_sec: float = float(os.getenv("MAX_CHARS_PER_SEC", "28.0"))
+ 
+     # ---- audio / VAD segmentation ----
+     sample_rate: int = int(os.getenv("SAMPLE_RATE", "16000"))
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 8ca44fe..94b4f5c 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -46,6 +46,7 @@ from contextlib import asynccontextmanager
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+ 
++from .api.routes_auth import router as auth_router
+ from .api.routes_health import router as health_router
+ from .api.routes_ws import router as ws_router
+ from .asr.postprocess import PostProcessor
+@@ -94,6 +95,7 @@ def build_provider():
+         project=settings.google_cloud_project,
+         location=settings.google_cloud_location,
+         max_words_per_sec=settings.max_words_per_sec,
++        max_chars_per_sec=settings.max_chars_per_sec,
+         thinking_budget=settings.gemini_thinking_budget,
+     )
+ 
+@@ -169,6 +171,7 @@ def create_app() -> FastAPI:
+         allow_headers=["*"],
+     )
+     app.include_router(health_router)
++    app.include_router(auth_router)
+     app.include_router(ws_router)
+     return app
+ 
+diff --git a/backend/app/session/state.py b/backend/app/session/state.py
+index 118ab3a..f460de7 100644
+--- a/backend/app/session/state.py
++++ b/backend/app/session/state.py
+@@ -57,6 +57,7 @@ from ..asr.scheduler import ASRQueueFull, ASRScheduler
+ from ..audio.vad import Segment, VADSegmenter
+ from ..config import settings
+ from ..diarization.factory import build_diarizer
++from ..tenant.models import PLANS
+ from .transcript import TranscriptStore
+ 
+ log = logging.getLogger("voxlive.session")
+@@ -168,6 +169,18 @@ class SessionState:
+         self.seg_id = 0
+         self.sequence = 0  # outbound message counter
+         self.dead = False
++
++        # ---- hard duration cap ---------------------------------------------
++        # `Plan.max_session_minutes` existed in the model and was enforced
++        # nowhere, so a browser tab left open on a stream billed Vertex AI for
++        # as long as it stayed open. Admission control only ever counted
++        # CONCURRENT sessions, which does not bound the duration of any of
++        # them. This is the cheapest possible ceiling: it costs one float
++        # comparison per audio chunk and it is the difference between a
++        # forgotten tab costing minutes and costing a weekend.
++        plan = PLANS.get(tenant.plan_code)
++        self.max_audio_sec = (plan.max_session_minutes * 60) if plan else 0
++        self.limit_reached = False
+         self.last_speaker_count = 0
+         self._last_beat = 0.0
+ 
+@@ -262,6 +275,32 @@ class SessionState:
+         """Accept one chunk of raw int16 PCM from the client."""
+         self.last_activity = time.time()
+ 
++        # Stop ACCEPTING audio at the plan ceiling, then drain normally, so
++        # the user keeps every word already transcribed. Dropping the socket
++        # outright would discard whatever is still in flight and leave them
++        # with a truncated transcript and no explanation.
++        if (
++            self.max_audio_sec
++            and not self.limit_reached
++            and self.seg.now >= self.max_audio_sec
++        ):
++            self.limit_reached = True
++            log.info(
++                "session reached the %.0f-minute plan limit; draining",
++                self.max_audio_sec / 60,
++                extra={"session_id": self.session_id, "event": "session_limit"},
++            )
++            await self.send(
++                error_msg(
++                    f"This session reached its {self.max_audio_sec // 60}-minute "
++                    "limit. Download the transcript, then start a new one."
++                )
++            )
++            await self.finish()
++            return
++        if self.limit_reached:
++            return
++
+         # Raw audio goes to the diarizer CONTINUOUSLY — it does its own VAD and
+         # needs an uninterrupted clock, not VAD segments with pre-roll padding
+         # glued on.
+diff --git a/backend/app/tenant/models.py b/backend/app/tenant/models.py
+index 22509f2..ca40623 100644
+--- a/backend/app/tenant/models.py
++++ b/backend/app/tenant/models.py
+@@ -179,6 +179,11 @@ class User:
+     role: UserRole = UserRole.MEMBER
+     status: UserStatus = UserStatus.ACTIVE
+     cognito_sub: Optional[str] = None
++    # scrypt hash produced by auth/passwords.py. Nullable because an INVITED
++    # user exists before they have chosen one, and because a future Cognito
++    # migration would leave this empty for every federated account.
++    # `repr=False` keeps it out of tracebacks and log lines that print a User.
++    password_hash: Optional[str] = field(default=None, repr=False)
+     created_at: float = field(default_factory=time.time)
+ 
+     @classmethod
+diff --git a/backend/app/tenant/repository.py b/backend/app/tenant/repository.py
+index 3b9552b..8a79d26 100644
+--- a/backend/app/tenant/repository.py
++++ b/backend/app/tenant/repository.py
+@@ -1,14 +1,7 @@
+ """
+ repository.py — the persistence seam for tenant data.
+ 
+-This is the supervisor's "persistence abstraction" (§43 commit 2), delivered
+-BEFORE PostgreSQL rather than after. The reason is ordering: tenant context
+-and quotas need somewhere to read organizations from, and if they read from a
+-concrete database the database ends up wired into the WebSocket route. An
+-interface here means the PostgreSQL commit changes one line in `main.py` and
+-nothing else.
+-
+-    routes_ws / quotas / session
++    routes_ws / routes_auth / quotas / session
+               │
+               ▼
+       TenantRepository  (interface)
+@@ -18,12 +11,27 @@ nothing else.
+ TENANT ISOLATION IS ENFORCED HERE, NOT ABOVE
+ --------------------------------------------
+ Note the shape of `get_user`: it takes BOTH a user id and an organization id,
+-and returns None if the user belongs to a different organization. This is the
+-supervisor's §36 rule expressed as a method signature — the SQL version will
+-be `WHERE id = :user_id AND organization_id = :org_id`, never a fetch followed
+-by a check in Python. Making the interface require the tenant id means a
+-caller CANNOT accidentally write the unscoped query; there is no method that
+-would let them.
++and returns None if the user belongs to a different organization. The SQL
++version will be `WHERE id = :user_id AND organization_id = :org_id`, never a
++fetch followed by a check in Python. Making the interface require the tenant
++id means a caller CANNOT accidentally write the unscoped query; there is no
++method that would let them.
++
++THE TWO DELIBERATELY UNSCOPED METHODS
++-------------------------------------
++`get_user_by_cognito_sub` and `find_users_by_email` do not take an
++organization id, because they are what ESTABLISHES one. Everything reached
++through them must immediately narrow to a single organization.
++
++`find_users_by_email` returns a LIST, and that is the whole reason the login
++flow has a second step. The schema says:
++
++    CONSTRAINT users_email_per_org_uq UNIQUE (organization_id, email)
++
++Email is unique WITHIN an organization, not globally — a contractor may
++legitimately hold accounts at two customers. So an email alone does not
++identify a user, and any login endpoint that assumes it does will silently
++sign people into whichever row the database happened to return first.
+ """
+ 
+ from __future__ import annotations
+@@ -32,14 +40,19 @@ import asyncio
+ from abc import ABC, abstractmethod
+ from typing import Optional
+ 
+-from .models import Organization, User
++from .models import Organization, User, UserRole, UserStatus
++
++
++class DuplicateEmailError(ValueError):
++    """This email already exists inside this organization."""
+ 
+ 
+ class TenantRepository(ABC):
+     """Read/write access to organizations and users.
+ 
+-    Every method that touches a user-owned row takes `organization_id`. That
+-    is not redundancy — it is the isolation boundary.
++    Every method that touches a user-owned row takes `organization_id`, except
++    the two documented above. That is not redundancy — it is the isolation
++    boundary.
+     """
+ 
+     @abstractmethod
+@@ -53,26 +66,51 @@ class TenantRepository(ABC):
+ 
+     @abstractmethod
+     async def get_user_by_cognito_sub(self, sub: str) -> Optional[User]:
+-        """Resolve an identity-provider subject to a user.
++        """Resolve an identity-provider subject to a user."""
+ 
+-        Not organization-scoped, because this is what ESTABLISHES the
+-        organization: the JWT gives a subject, this returns the user, and the
+-        user carries the organization_id every later call is scoped by.
++    @abstractmethod
++    async def find_users_by_email(self, email: str) -> list[User]:
++        """Every user row carrying this email, across all organizations.
++
++        Unscoped on purpose: this is the lookup that establishes tenancy. The
++        caller must verify a password against each candidate and then narrow
++        to exactly one organization before doing anything else.
+         """
+ 
++    @abstractmethod
++    async def get_user_in_organization_by_email(
++        self, email: str, organization_id: str
++    ) -> Optional[User]:
++        """Scoped counterpart, used to enforce the per-organization unique."""
++
+     @abstractmethod
+     async def save_organization(self, organization: Organization) -> Organization: ...
+ 
+     @abstractmethod
+     async def save_user(self, user: User) -> User: ...
+ 
++    @abstractmethod
++    async def create_organization_with_owner(
++        self,
++        organization: Organization,
++        owner: User,
++    ) -> tuple[Organization, User]:
++        """Create both, or neither.
++
++        Signup is the only place a new organization appears. If the org write
++        succeeds and the user write fails, the result is an organization
++        nobody can sign in to and whose name is now taken — a state with no
++        recovery path through the UI. In SQL this is one transaction; here it
++        is one lock.
++        """
++
+ 
+ class InMemoryTenantRepository(TenantRepository):
+     """Dict-backed repository.
+ 
+     Real in development and in tests; replaced by SQL in production. It is
+-    NOT a toy — it implements the same isolation rules, so a test that passes
+-    here would pass against PostgreSQL.
++    NOT a toy — it implements the same isolation and uniqueness rules, so a
++    test that passes here would pass against PostgreSQL.
+     """
+ 
+     def __init__(self) -> None:
+@@ -81,6 +119,8 @@ class InMemoryTenantRepository(TenantRepository):
+         self._by_sub: dict[str, str] = {}  # cognito_sub -> user_id
+         self._lock = asyncio.Lock()
+ 
++    # ------------------------------------------------------------------ read
++
+     async def get_organization(self, organization_id: str) -> Optional[Organization]:
+         return self._orgs.get(organization_id)
+ 
+@@ -98,6 +138,28 @@ class InMemoryTenantRepository(TenantRepository):
+         user_id = self._by_sub.get(sub)
+         return self._users.get(user_id) if user_id else None
+ 
++    async def find_users_by_email(self, email: str) -> list[User]:
++        needle = email.strip().lower()
++        if not needle:
++            return []
++        # Sorted by creation time so the candidate order a user sees on the
++        # organization chooser is stable between requests.
++        return sorted(
++            (u for u in self._users.values() if u.email == needle),
++            key=lambda u: u.created_at,
++        )
++
++    async def get_user_in_organization_by_email(
++        self, email: str, organization_id: str
++    ) -> Optional[User]:
++        needle = email.strip().lower()
++        for user in self._users.values():
++            if user.email == needle and user.organization_id == organization_id:
++                return user
++        return None
++
++    # ----------------------------------------------------------------- write
++
+     async def save_organization(self, organization: Organization) -> Organization:
+         async with self._lock:
+             self._orgs[organization.id] = organization
+@@ -105,15 +167,63 @@ class InMemoryTenantRepository(TenantRepository):
+ 
+     async def save_user(self, user: User) -> User:
+         async with self._lock:
++            self._assert_email_free(user)
+             self._users[user.id] = user
+             if user.cognito_sub:
+                 self._by_sub[user.cognito_sub] = user.id
+         return user
+ 
++    async def create_organization_with_owner(
++        self,
++        organization: Organization,
++        owner: User,
++    ) -> tuple[Organization, User]:
++        if owner.organization_id != organization.id:
++            raise ValueError("owner.organization_id does not match the organization")
++        async with self._lock:
++            if organization.id in self._orgs:
++                raise ValueError(f"organization {organization.id} already exists")
++            self._assert_email_free(owner)
++            self._orgs[organization.id] = organization
++            self._users[owner.id] = owner
++            if owner.cognito_sub:
++                self._by_sub[owner.cognito_sub] = owner.id
++        return organization, owner
++
++    def _assert_email_free(self, user: User) -> None:
++        """Mirror `users_email_per_org_uq`. Caller must hold the lock.
++
++        Without this the in-memory repository would accept a duplicate that
++        PostgreSQL will later reject, and the bug would only appear after the
++        database migration — in production, on the signup path.
++        """
++        for existing in self._users.values():
++            if (
++                existing.id != user.id
++                and existing.organization_id == user.organization_id
++                and existing.email == user.email
++            ):
++                raise DuplicateEmailError(
++                    f"{user.email} already has an account in this organization"
++                )
++
+     # ---- helpers that only make sense for the in-memory implementation ----
+ 
+     async def list_organizations(self) -> list[Organization]:
+         return list(self._orgs.values())
+ 
++    async def list_users(self, organization_id: str) -> list[User]:
++        return [u for u in self._users.values() if u.organization_id == organization_id]
++
+     async def count(self) -> tuple[int, int]:
+         return len(self._orgs), len(self._users)
++
++
++__all__ = [
++    "DuplicateEmailError",
++    "InMemoryTenantRepository",
++    "TenantRepository",
++    "User",
++    "UserRole",
++    "UserStatus",
++]
+diff --git a/backend/app/tenant/seed.py b/backend/app/tenant/seed.py
+index dd0fb9a..a0d714e 100644
+--- a/backend/app/tenant/seed.py
++++ b/backend/app/tenant/seed.py
+@@ -26,11 +26,27 @@ from __future__ import annotations
+ 
+ import logging
+ 
++from ..auth.passwords import hash_password
+ from .models import Organization, OrganizationStatus, User, UserRole, UserStatus
+ from .repository import TenantRepository
+ 
+ log = logging.getLogger("voxlive.tenant")
+ 
++# Every seeded user shares this password so the login screen is usable the
++# moment the stack starts. Seeding only runs under APP_ENV=development.
++DEV_PASSWORD = "voxlive-dev-password"
++
++
++_CACHED_HASH: str | None = None
++
++
++def _dev_hash() -> str:
++    """Hash the shared dev password once — scrypt is ~60 ms per call."""
++    global _CACHED_HASH
++    if _CACHED_HASH is None:
++        _CACHED_HASH = hash_password(DEV_PASSWORD)
++    return _CACHED_HASH
++
+ 
+ async def seed_development_tenants(repo: TenantRepository) -> None:
+     acme = Organization(
+@@ -61,6 +77,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
+             email="alice@acme.example",
+             name="Alice",
+             role=UserRole.ADMIN,
++            password_hash=_dev_hash(),
+             cognito_sub="dev-sub-alice",
+         ),
+         User(
+@@ -69,6 +86,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
+             email="bob@acme.example",
+             name="Bob",
+             role=UserRole.MEMBER,
++            password_hash=_dev_hash(),
+             cognito_sub="dev-sub-bob",
+         ),
+         User(
+@@ -77,6 +95,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
+             email="carol@acme.example",
+             name="Carol",
+             role=UserRole.VIEWER,
++            password_hash=_dev_hash(),
+             cognito_sub="dev-sub-carol",
+         ),
+         User(
+@@ -85,6 +104,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
+             email="dave@globex.example",
+             name="Dave",
+             role=UserRole.OWNER,
++            password_hash=_dev_hash(),
+             cognito_sub="dev-sub-dave",
+         ),
+         User(
+@@ -94,6 +114,7 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
+             name="Erin",
+             role=UserRole.OWNER,
+             status=UserStatus.ACTIVE,
++            password_hash=_dev_hash(),
+             cognito_sub="dev-sub-erin",
+         ),
+     ]
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 97f75cf..78f163d 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -47,8 +47,30 @@ python-dotenv>=1.0
+ # ASR
+ google-genai>=1.0
+ 
++# ---- authentication (app/auth, app/api/routes_auth.py) ----
++# PyJWT is pure Python and ~100 KB. Password hashing uses hashlib.scrypt from
++# the standard library on purpose: bcrypt and argon2-cffi both pull a compiled
++# extension, which means either a manylinux wheel or a C toolchain in the
++# image, for a primitive OpenSSL already provides.
++pyjwt>=2.8
++# EmailStr in the signup/login schemas needs this; pydantic does not bundle it.
++email-validator>=2.0
++
+ # Diarization. NOTE: v10 dropped speaker-diarization-community-1, so the
+ # pyannote.audio 4.x requirement is gone -- 3.1 is enough for the embedder.
++#
++# INSTALL TORCH FROM THE CPU INDEX BEFORE THIS FILE, ALWAYS:
++#
++#     pip install --index-url https://download.pytorch.org/whl/cpu \
++#         "torch>=2.2" "torchaudio>=2.2"
++#     pip install -r requirements.txt
++#
++# Plain `pip install torch` on Linux pulls the CUDA build -- nvidia-cudnn,
++# nvidia-cublas, nvidia-nccl and the rest, roughly 2 GB of GPU libraries that
++# cannot execute on a Fargate task because Fargate has no GPU. Installing the
++# CPU wheel first means the line below sees torch as already satisfied and
++# will not pull the CUDA build to satisfy pyannote's dependency. This is worth
++# ~2 GB of image on every deploy and every scale-out. See deploy/Dockerfile.
+ pyannote.audio>=3.1
+ torch>=2.2
+ webrtcvad-wheels>=2.0.14
+diff --git a/backend/tests/test_asr_validation_regressions.py b/backend/tests/test_asr_validation_regressions.py
+new file mode 100644
+index 0000000..9717e26
+--- /dev/null
++++ b/backend/tests/test_asr_validation_regressions.py
+@@ -0,0 +1,169 @@
++"""
++Regression tests for the ASR content guards.
++
++Each test here corresponds to a bug that reached the transcript. The first
++class is the important one: it locks in behaviour that was WRONG for the whole
++life of the previous validation module, and wrong in the direction that
++deletes real speech rather than the direction that lets garbage through — so
++it never appeared as a complaint about hallucination, only as turns that
++quietly never showed up.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from app.asr.validation import (
++    clean_transcript,
++    dominant_language,
++    echoes_context,
++    longest_token_run,
++    looks_degenerate,
++)
++
++LANGS = ("si", "en", "ta")
++
++
++class TestShortUtterancesSurvive:
++    """`MIN_TOKENS_AFTER_STRIP = 3` dropped every one- and two-word turn.
++
++    The constant was meant to express "too little survived the foreign-script
++    strip to be trustworthy", but it was applied to the token count of text
++    that had never been stripped. A clean 'ඔව්' measured one token, tripped
++    the check, and was discarded with the reason 'foreign script 0%, nothing
++    usable left' — a message whose own numbers contradict the decision.
++
++    Short answers are a large share of turns in conversational Sinhala and
++    Tamil, so this removed real speech continuously.
++    """
++
++    @pytest.mark.parametrize(
++        "text",
++        [
++            "ඔව්",  # yes
++            "නෑ",  # no
++            "හරි",  # ok / right
++            "ස්තූතියි",  # thank you
++            "ஆம்",  # yes (Tamil)
++            "சரி",  # ok (Tamil)
++            "yes okay",
++            "thank you",
++            "mm hmm",
++            "2024",
++        ],
++    )
++    def test_clean_short_text_is_kept(self, text):
++        cleaned, dropped = clean_transcript(text, LANGS)
++        assert dropped is None, f"{text!r} was dropped: {dropped}"
++        assert cleaned == text
++
++    def test_a_clean_segment_is_never_dropped_for_being_short(self):
++        """The drop branch requires contamination, so 0% foreign cannot reach it."""
++        for text in ("a", "ඔ", "ok"):
++            _, dropped = clean_transcript(text, LANGS)
++            assert dropped is None
++
++
++class TestForeignScriptStillRejected:
++    """The behaviour the module was built for must not regress."""
++
++    def test_wholly_foreign_text_is_dropped(self):
++        cleaned, dropped = clean_transcript("ހކއހވ ހކއހވ ހކއހވ", LANGS)
++        assert cleaned == ""
++        assert dropped and "foreign script" in dropped
++
++    def test_heavily_contaminated_short_remnant_is_dropped(self):
++        """One good token surviving a mostly-Thaana segment is not a transcript."""
++        cleaned, dropped = clean_transcript("ඔව් ހކއހވ ހކއހވ", LANGS)
++        assert cleaned == ""
++        assert dropped and "remnant too short" in dropped
++
++    def test_lightly_contaminated_long_text_keeps_the_good_part(self):
++        text = "අපි කරන්න ඕන දේ ހކއހވ තමයි මේක වගේ දෙයක්"
++        cleaned, dropped = clean_transcript(text, LANGS)
++        assert dropped is None
++        assert "ހކއހވ" not in cleaned
++        assert "අපි" in cleaned
++
++    def test_sinhala_zwj_conjuncts_are_not_foreign(self):
++        """U+200D is structural in Sinhala; treating it as foreign ate words."""
++        text = "මෙය ක්‍රියාත්මක කරන්න ඕන දෙයක් වෙනවා"
++        cleaned, dropped = clean_transcript(text, LANGS)
++        assert dropped is None
++        assert "ක්‍රියාත්මක" in cleaned
++
++
++class TestRepetitionLoops:
++    """The n-gram check needed 12 tokens, so short loops passed untouched."""
++
++    @pytest.mark.parametrize(
++        "text",
++        [
++            "ok ok ok ok",
++            "හරි හරි හරි හරි හරි",
++            "yes. yes. yes. yes.",
++        ],
++    )
++    def test_short_runs_are_caught(self, text):
++        _, dropped = clean_transcript(text, LANGS)
++        assert dropped == "repetition loop"
++
++    @pytest.mark.parametrize(
++        "text",
++        [
++            "no no I meant the other one",  # doubling for emphasis
++            "very very very good",  # tripling is still human
++        ],
++    )
++    def test_natural_emphasis_survives(self, text):
++        _, dropped = clean_transcript(text, LANGS)
++        assert dropped is None
++
++    def test_run_detector_ignores_trailing_punctuation(self):
++        assert longest_token_run("ok, ok. ok! ok".split()) == 4
++
++    def test_long_phrase_loop_still_caught(self):
++        text = " ".join(["the budget meeting is on friday"] * 4)
++        assert looks_degenerate(text)
++
++
++class TestContextEcho:
++    """The rolling hint was sent to the model and never audited on the way back."""
++
++    def test_output_that_repeats_the_hint_is_dropped(self):
++        context = "so anyway we need to finalise the budget before friday please"
++        text = "we need to finalise the budget before friday"
++        _, dropped = clean_transcript(text, LANGS, context)
++        assert dropped and "echoed the context" in dropped
++
++    def test_genuinely_new_speech_passes_with_context_present(self):
++        context = "so anyway we need to finalise the budget before friday please"
++        text = "I think Nimal already sent the revised figures this morning"
++        _, dropped = clean_transcript(text, LANGS, context)
++        assert dropped is None
++
++    def test_short_confirmations_are_exempt(self):
++        """'හරි' recurring across turns is a person agreeing, not a loop."""
++        context = "හරි එහෙනම් අපි හෙට කතා කරමු හරි"
++        assert not echoes_context("හරි", context)
++
++
++class TestLanguageLabel:
++    """`language` and `text` are generated independently; only one is constrained."""
++
++    @pytest.mark.parametrize(
++        "text,expected",
++        [
++            ("ඔව් හරි", "si"),
++            ("hello there", "en"),
++            ("வணக்கம் நண்பரே", "ta"),
++            # A Sinhala sentence carrying an English brand name is a Sinhala
++            # turn — Latin must not win on a near-tie.
++            ("අපි Google Meet එකෙන් කතා කරමු", "si"),
++        ],
++    )
++    def test_dominant_language(self, text, expected):
++        assert dominant_language(text) == expected
++
++    def test_no_script_returns_none(self):
++        assert dominant_language("123 456 ...") is None
+diff --git a/frontend/.env.example b/frontend/.env.example
+index 6232cb2..9731ca0 100644
+--- a/frontend/.env.example
++++ b/frontend/.env.example
+@@ -1,27 +1,32 @@
+-# Backend WebSocket origin. Default works for local dev; no need to set this
+-# unless your backend runs elsewhere.
++# Backend HTTP origin, used for /auth/signup, /auth/login and /auth/me.
++VITE_API_URL=http://localhost:8000
++
++# Backend WebSocket origin.
+ VITE_WS_URL=ws://localhost:8000
+ 
+ # ---------------------------------------------------------------------------
+-# DEVELOPMENT IDENTITY  (temporary — removed when Cognito lands)
++# Identity now comes from signing in. The frontend stores the token returned by
++# POST /auth/login and sends it as ?token= on every WebSocket connection.
++#
++# The two variables below are a DEVELOPMENT ESCAPE HATCH for the load harness
++# only -- they let a script open a socket without a login. The backend ignores
++# them unless APP_ENV=development, because DevPrincipalResolver refuses to
++# construct outside it, so leaving them set cannot weaken a deployed
++# environment. Leave them blank for normal use.
+ #
+-# The backend refuses anonymous WebSocket connections and closes them with
+-# code 1008. Until there is a real login, the frontend asserts an identity
+-# here. These ids come from backend/app/tenant/seed.py:
++# Seeded development accounts (backend/app/tenant/seed.py) all share the
++# password `voxlive-dev-password`:
+ #
+ #   org_dev_acme    ACME Media           Business plan, 25 concurrent
+-#     usr_dev_alice   admin
+-#     usr_dev_bob     member
+-#     usr_dev_carol   viewer   <- authenticates, but CANNOT start a session
++#     alice@acme.example    admin
++#     bob@acme.example      member
++#     carol@acme.example    viewer   <- signs in, but CANNOT start a session
+ #
+ #   org_dev_globex  Globex Broadcasting  Starter plan, 5 concurrent
+-#     usr_dev_dave    owner    <- use this to see the quota limit quickly
++#     dave@globex.example   owner    <- use this to hit the quota quickly
+ #
+ #   org_dev_suspended  Initech           SUSPENDED, always refused
+-#     usr_dev_erin    owner
+-#
+-# This is NOT authentication — the server trusts what the browser sends, which
+-# is why DevPrincipalResolver refuses to start unless APP_ENV=development.
++#     erin@initech.example  owner
+ # ---------------------------------------------------------------------------
+-VITE_ORG_ID=org_dev_acme
+-VITE_USER_ID=usr_dev_alice
+\ No newline at end of file
++VITE_ORG_ID=
++VITE_USER_ID=
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index d2eb388..4fc5626 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState, useEffect } from "react";
+ import { useAudioStream } from "./hooks/useAudioStream";
+ import { useTranscript } from "./components/TranscriptView.jsx";
+ import TranscriptView from "./components/TranscriptView.jsx";
++import { useAuth } from "./auth/AuthContext.jsx";
+ 
+ const WS_URL =
+   (import.meta.env.VITE_WS_URL || "ws://localhost:8000") + "/ws/transcribe";
+@@ -39,6 +40,7 @@ const SOURCES = [
+ const SPEAKER_CHOICES = [0, 2, 3, 4, 5, 6];
+ 
+ export default function App() {
++  const { user, signOut } = useAuth();
+   const [source, setSource] = useState("mic");
+   const [expectedSpeakers, setExpectedSpeakers] = useState(0);
+   const [errors, setErrors] = useState([]);
+@@ -218,6 +220,7 @@ export default function App() {
+         <div className="flex items-center gap-4">
+           {recording && <LevelMeter level={level} />}
+           <StatusPill status={status} recording={recording} />
++          <AccountMenu user={user} onSignOut={signOut} recording={recording} />
+         </div>
+       </header>
+ 
+@@ -509,3 +512,41 @@ function tsForFilename() {
+     d.getHours(),
+   )}-${p(d.getMinutes())}`;
+ }
++
++/**
++ * AccountMenu — which organization this transcript belongs to, and a way out.
++ *
++ * The organization name is shown rather than only the email because it is the
++ * thing that changes what the session does: quota, plan and every stored
++ * transcript are scoped to it, and a person with accounts at two customers
++ * otherwise has no way to tell which one they are recording into.
++ *
++ * Sign out is disabled while recording. It drops the token, which closes the
++ * socket mid-sentence and loses an undownloaded transcript.
++ */
++function AccountMenu({ user, onSignOut, recording }) {
++  if (!user) return null;
++  return (
++    <div className="flex items-center gap-3 border-l border-neutral-200 pl-4">
++      <div className="hidden text-right leading-tight sm:block">
++        <div className="text-xs font-medium text-neutral-700">
++          {user.organizationName}
++        </div>
++        <div className="text-[11px] text-neutral-400">{user.email}</div>
++      </div>
++      <button
++        type="button"
++        onClick={onSignOut}
++        disabled={recording}
++        title={
++          recording
++            ? "Stop the recording before signing out"
++            : "Sign out of VoxLive"
++        }
++        className="rounded-full border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
++      >
++        Sign out
++      </button>
++    </div>
++  );
++}
+diff --git a/frontend/src/auth/AuthContext.jsx b/frontend/src/auth/AuthContext.jsx
+new file mode 100644
+index 0000000..70a322a
+--- /dev/null
++++ b/frontend/src/auth/AuthContext.jsx
+@@ -0,0 +1,221 @@
++import {
++  createContext,
++  useCallback,
++  useContext,
++  useEffect,
++  useMemo,
++  useState,
++} from "react";
++
++/**
++ * AuthContext — who is signed in, and the token every WebSocket needs.
++ *
++ * WHERE THE TOKEN LIVES
++ * ---------------------
++ * localStorage. That is readable by any script running on this origin, so an
++ * XSS bug becomes a stolen session. The alternative — an httpOnly cookie —
++ * is not available here for a real reason: the browser WebSocket API cannot
++ * set headers, so the backend reads the credential from `?token=`, which
++ * means JavaScript has to be able to read it too.
++ *
++ * What that buys, and what it costs, is worth being explicit about:
++ *   + a reload or a reopened tab keeps you signed in
++ *   - the token is only as safe as the app's dependency tree
++ *
++ * The mitigations are the token's short TTL (AUTH_ACCESS_TTL_SEC, 12 h by
++ * default) and the fact that it grants nothing beyond one organization's
++ * transcription sessions.
++ *
++ * `getStoredToken` is exported separately because `useAudioStream` needs the
++ * token when it builds the socket URL, and that happens inside a callback
++ * where reading it from React state would capture a stale value.
++ */
++
++const TOKEN_KEY = "voxlive.access_token";
++
++const API_BASE = (
++  import.meta.env.VITE_API_URL || "http://localhost:8000"
++).replace(/\/+$/, "");
++
++export function getStoredToken() {
++  try {
++    return window.localStorage.getItem(TOKEN_KEY) || "";
++  } catch {
++    // Private browsing modes throw on storage access rather than returning
++    // null. Signing in still works; it just will not survive a reload.
++    return "";
++  }
++}
++
++function storeToken(token) {
++  try {
++    if (token) window.localStorage.setItem(TOKEN_KEY, token);
++    else window.localStorage.removeItem(TOKEN_KEY);
++  } catch {
++    /* see above */
++  }
++}
++
++/** POST/GET against the backend, surfacing FastAPI's `detail` as the message. */
++async function api(path, { method = "GET", body, token } = {}) {
++  let response;
++  try {
++    response = await fetch(`${API_BASE}${path}`, {
++      method,
++      headers: {
++        ...(body ? { "Content-Type": "application/json" } : {}),
++        ...(token ? { Authorization: `Bearer ${token}` } : {}),
++      },
++      body: body ? JSON.stringify(body) : undefined,
++    });
++  } catch {
++    // fetch only rejects on a network-level failure, so this is genuinely
++    // "the backend is not reachable" rather than any 4xx or 5xx.
++    throw new Error(
++      `Can't reach the server at ${API_BASE}. Check that the backend is running.`,
++    );
++  }
++
++  const payload = await response.json().catch(() => ({}));
++  if (!response.ok) {
++    const detail = payload?.detail;
++    throw new Error(
++      typeof detail === "string"
++        ? detail
++        : // 422 from Pydantic arrives as a list of field errors; show the
++          // first one rather than "[object Object]".
++          detail?.[0]?.msg || `Request failed (${response.status}).`,
++    );
++  }
++  return payload;
++}
++
++const AuthContext = createContext(null);
++
++export function AuthProvider({ children }) {
++  const [user, setUser] = useState(null);
++  const [token, setToken] = useState(getStoredToken);
++  // `loading` covers only the initial /auth/me call. Rendering the sign-in
++  // screen before it resolves would flash a login form at someone who is
++  // already signed in.
++  const [loading, setLoading] = useState(Boolean(getStoredToken()));
++
++  const applySession = useCallback((session) => {
++    storeToken(session.access_token);
++    setToken(session.access_token);
++    setUser({
++      id: session.user_id,
++      email: session.email,
++      name: session.name,
++      role: session.role,
++      organizationId: session.organization_id,
++      organizationName: session.organization_name,
++      planCode: session.plan_code,
++    });
++    return session;
++  }, []);
++
++  const signOut = useCallback(() => {
++    storeToken("");
++    setToken("");
++    setUser(null);
++  }, []);
++
++  // Rehydrate on load. This re-reads the user server-side rather than
++  // decoding the token, so a role change or a disabled account takes effect
++  // on the next page load instead of at token expiry.
++  useEffect(() => {
++    const stored = getStoredToken();
++    if (!stored) {
++      setLoading(false);
++      return;
++    }
++    let cancelled = false;
++    api("/auth/me", { token: stored })
++      .then((session) => {
++        if (!cancelled) applySession(session);
++      })
++      .catch(() => {
++        // Expired, revoked, or the backend is down. Either way there is no
++        // usable session, and keeping a dead token only produces a confusing
++        // 1008 close on the first recording attempt.
++        if (!cancelled) signOut();
++      })
++      .finally(() => {
++        if (!cancelled) setLoading(false);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [applySession, signOut]);
++
++  const signIn = useCallback(
++    async ({ email, password, organizationId }) => {
++      const result = await api("/auth/login", {
++        method: "POST",
++        body: {
++          email,
++          password,
++          ...(organizationId ? { organization_id: organizationId } : {}),
++        },
++      });
++      // The same email can exist in several organizations, so a successful
++      // password check does not always identify one account. The caller
++      // renders a chooser and calls chooseOrganization next.
++      if (result.needs_organization) return result;
++      return applySession(result);
++    },
++    [applySession],
++  );
++
++  const chooseOrganization = useCallback(
++    async ({ orgSelectToken, organizationId }) =>
++      applySession(
++        await api("/auth/login/organization", {
++          method: "POST",
++          body: {
++            org_select_token: orgSelectToken,
++            organization_id: organizationId,
++          },
++        }),
++      ),
++    [applySession],
++  );
++
++  const signUp = useCallback(
++    async ({ organizationName, name, email, password }) =>
++      applySession(
++        await api("/auth/signup", {
++          method: "POST",
++          body: {
++            organization_name: organizationName,
++            name,
++            email,
++            password,
++          },
++        }),
++      ),
++    [applySession],
++  );
++
++  const value = useMemo(
++    () => ({
++      user,
++      token,
++      loading,
++      signIn,
++      signUp,
++      signOut,
++      chooseOrganization,
++    }),
++    [user, token, loading, signIn, signUp, signOut, chooseOrganization],
++  );
++
++  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
++}
++
++export function useAuth() {
++  const ctx = useContext(AuthContext);
++  if (!ctx) throw new Error("useAuth must be used inside <AuthProvider>");
++  return ctx;
++}
+diff --git a/frontend/src/auth/AuthScreen.jsx b/frontend/src/auth/AuthScreen.jsx
+new file mode 100644
+index 0000000..4da3ed2
+--- /dev/null
++++ b/frontend/src/auth/AuthScreen.jsx
+@@ -0,0 +1,321 @@
++import { useCallback, useState } from "react";
++import { useAuth } from "./AuthContext.jsx";
++
++/**
++ * AuthScreen — sign in, or create an organization.
++ *
++ * THREE MODES, NOT THREE PAGES
++ * ----------------------------
++ *   signin   email + password
++ *   signup   organization name + your name + email + password
++ *   choose   which organization — reached only when one email and password
++ *            matched accounts in more than one of them
++ *
++ * `choose` exists because the database makes email unique PER ORGANIZATION.
++ * It is rare, so it is a step that appears when needed rather than a field
++ * everyone fills in. Asking for the organization up front would also be a
++ * privacy problem: it would let anyone test whether a given person holds an
++ * account at a given company.
++ *
++ * The visual language is the transcript view's — neutral greys, pill buttons,
++ * one accent — because this is the same product, not a marketing page in
++ * front of it.
++ */
++
++const MIN_PASSWORD_LENGTH = 10;
++
++export default function AuthScreen() {
++  const { signIn, signUp, chooseOrganization } = useAuth();
++
++  const [mode, setMode] = useState("signin");
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState("");
++
++  const [organizationName, setOrganizationName] = useState("");
++  const [name, setName] = useState("");
++  const [email, setEmail] = useState("");
++  const [password, setPassword] = useState("");
++
++  // Set when the backend needs an organization chosen.
++  const [choice, setChoice] = useState(null);
++
++  const switchMode = useCallback((next) => {
++    setMode(next);
++    setError("");
++    setChoice(null);
++    setPassword("");
++  }, []);
++
++  const run = useCallback(async (work) => {
++    setBusy(true);
++    setError("");
++    try {
++      return await work();
++    } catch (err) {
++      setError(err.message || "Something went wrong.");
++      return null;
++    } finally {
++      setBusy(false);
++    }
++  }, []);
++
++  const onSubmit = useCallback(async () => {
++    if (mode === "signup") {
++      if (password.length < MIN_PASSWORD_LENGTH) {
++        setError(
++          `Use at least ${MIN_PASSWORD_LENGTH} characters. Length matters more than symbols.`,
++        );
++        return;
++      }
++      await run(() => signUp({ organizationName, name, email, password }));
++      return;
++    }
++    const result = await run(() => signIn({ email, password }));
++    if (result?.needs_organization) {
++      setChoice({
++        token: result.org_select_token,
++        organizations: result.organizations,
++      });
++    }
++  }, [
++    mode,
++    run,
++    signIn,
++    signUp,
++    organizationName,
++    name,
++    email,
++    password,
++  ]);
++
++  const onChoose = useCallback(
++    async (organizationId) => {
++      const done = await run(() =>
++        chooseOrganization({
++          orgSelectToken: choice.token,
++          organizationId,
++        }),
++      );
++      // The chooser token is one-use in practice and short-lived. If it has
++      // expired, send the person back to the password step rather than
++      // leaving them on a list of buttons that will keep failing.
++      if (!done) setChoice(null);
++    },
++    [choice, chooseOrganization, run],
++  );
++
++  // Enter should submit. There is no <form> element here on purpose: a form
++  // in this app would trigger a full page navigation on submit in some
++  // browsers, which discards the audio worklet and the socket.
++  const onKeyDown = useCallback(
++    (e) => {
++      if (e.key === "Enter" && !busy) onSubmit();
++    },
++    [busy, onSubmit],
++  );
++
++  return (
++    <div className="flex min-h-full items-center justify-center bg-neutral-50 px-6 py-12 text-neutral-900">
++      <div className="w-full max-w-sm">
++        <div className="mb-8 text-center">
++          <h1 className="text-2xl font-semibold tracking-tight">VoxLive</h1>
++          <p className="mt-1 text-xs text-neutral-500">
++            Sinhala · English · Tamil
++          </p>
++        </div>
++
++        <div className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm">
++          {choice ? (
++            <ChooseOrganization
++              organizations={choice.organizations}
++              busy={busy}
++              error={error}
++              onChoose={onChoose}
++              onCancel={() => switchMode("signin")}
++            />
++          ) : (
++            <>
++              <h2 className="text-base font-medium">
++                {mode === "signup" ? "Create an organization" : "Sign in"}
++              </h2>
++              <p className="mt-1 text-xs text-neutral-500">
++                {mode === "signup"
++                  ? "You'll be its owner and can add your team afterwards."
++                  : "Use the account your organization gave you."}
++              </p>
++
++              <div className="mt-5 space-y-3">
++                {mode === "signup" && (
++                  <>
++                    <Field
++                      label="Organization name"
++                      value={organizationName}
++                      onChange={setOrganizationName}
++                      onKeyDown={onKeyDown}
++                      autoComplete="organization"
++                      placeholder="Sri Lanka Telecom"
++                    />
++                    <Field
++                      label="Your name"
++                      value={name}
++                      onChange={setName}
++                      onKeyDown={onKeyDown}
++                      autoComplete="name"
++                      placeholder="Dulhara Kaushalya"
++                    />
++                  </>
++                )}
++                <Field
++                  label="Email"
++                  type="email"
++                  value={email}
++                  onChange={setEmail}
++                  onKeyDown={onKeyDown}
++                  autoComplete="email"
++                  placeholder="you@example.com"
++                />
++                <Field
++                  label="Password"
++                  type="password"
++                  value={password}
++                  onChange={setPassword}
++                  onKeyDown={onKeyDown}
++                  autoComplete={
++                    mode === "signup" ? "new-password" : "current-password"
++                  }
++                  hint={
++                    mode === "signup"
++                      ? `At least ${MIN_PASSWORD_LENGTH} characters`
++                      : undefined
++                  }
++                />
++              </div>
++
++              {error && <ErrorNote>{error}</ErrorNote>}
++
++              <button
++                type="button"
++                onClick={onSubmit}
++                disabled={busy || !email || !password}
++                className="mt-5 w-full rounded-full bg-neutral-900 px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
++              >
++                {busy
++                  ? "Working…"
++                  : mode === "signup"
++                    ? "Create organization"
++                    : "Sign in"}
++              </button>
++
++              <p className="mt-4 text-center text-xs text-neutral-500">
++                {mode === "signup" ? (
++                  <>
++                    Already have an account?{" "}
++                    <LinkButton onClick={() => switchMode("signin")}>
++                      Sign in
++                    </LinkButton>
++                  </>
++                ) : (
++                  <>
++                    Setting up a new team?{" "}
++                    <LinkButton onClick={() => switchMode("signup")}>
++                      Create an organization
++                    </LinkButton>
++                  </>
++                )}
++              </p>
++            </>
++          )}
++        </div>
++
++        <p className="mt-4 text-center text-xs text-neutral-400">
++          Transcripts stay in your browser until you download them.
++        </p>
++      </div>
++    </div>
++  );
++}
++
++function ChooseOrganization({
++  organizations,
++  busy,
++  error,
++  onChoose,
++  onCancel,
++}) {
++  return (
++    <>
++      <h2 className="text-base font-medium">Choose an organization</h2>
++      <p className="mt-1 text-xs text-neutral-500">
++        This email is registered with more than one.
++      </p>
++
++      <div className="mt-5 space-y-2">
++        {organizations.map((org) => (
++          <button
++            key={org.organization_id}
++            type="button"
++            disabled={busy}
++            onClick={() => onChoose(org.organization_id)}
++            className="flex w-full items-center justify-between rounded-xl border border-neutral-200 px-4 py-3 text-left transition-colors hover:border-neutral-400 hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-40"
++          >
++            <span className="text-sm font-medium">
++              {org.organization_name}
++            </span>
++            <span className="text-xs uppercase tracking-wide text-neutral-400">
++              {org.role}
++            </span>
++          </button>
++        ))}
++      </div>
++
++      {error && <ErrorNote>{error}</ErrorNote>}
++
++      <button
++        type="button"
++        onClick={onCancel}
++        className="mt-4 w-full text-center text-xs text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
++      >
++        Use a different account
++      </button>
++    </>
++  );
++}
++
++function Field({ label, hint, value, onChange, type = "text", ...rest }) {
++  return (
++    <label className="block">
++      <span className="text-xs font-medium text-neutral-600">{label}</span>
++      <input
++        {...rest}
++        type={type}
++        value={value}
++        onChange={(e) => onChange(e.target.value)}
++        className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 focus:ring-1 focus:ring-neutral-900"
++      />
++      {hint && <span className="mt-1 block text-xs text-neutral-400">{hint}</span>}
++    </label>
++  );
++}
++
++function ErrorNote({ children }) {
++  return (
++    <div
++      role="alert"
++      className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800"
++    >
++      {children}
++    </div>
++  );
++}
++
++function LinkButton({ onClick, children }) {
++  return (
++    <button
++      type="button"
++      onClick={onClick}
++      className="font-medium text-neutral-900 underline underline-offset-2 hover:text-neutral-600"
++    >
++      {children}
++    </button>
++  );
++}
+diff --git a/frontend/src/hooks/useAudioStream.js b/frontend/src/hooks/useAudioStream.js
+index 2f82f25..789270f 100644
+--- a/frontend/src/hooks/useAudioStream.js
++++ b/frontend/src/hooks/useAudioStream.js
+@@ -1,4 +1,5 @@
+ import { useCallback, useRef, useState } from "react";
++import { getStoredToken } from "../auth/AuthContext.jsx";
+ 
+ // Streams 16 kHz mono Int16 PCM to the backend over a WebSocket, from one of
+ // two sources:
+@@ -29,8 +30,19 @@ const TARGET_SAMPLE_RATE = 16000;
+ const STOP_FLUSH_TIMEOUT_MS = 20000;
+ const LEVEL_UPDATE_MS = 100;
+ 
+-// Development identity. Matches the seeded tenants in
+-// backend/app/tenant/seed.py. Cognito replaces this entirely.
++// Identity now comes from the signed token issued by POST /auth/login. It is
++// read at CONNECT time rather than captured in a closure, so a session that
++// was refreshed while the page stayed open uses the current token.
++//
++// The token travels as ?token= because the browser WebSocket API cannot set
++// an Authorization header. Two deployment consequences follow, and both are
++// requirements rather than hardening:
++//   * keep AUTH_ACCESS_TTL_SEC short — URLs reach history and proxy logs
++//   * ALB access logging must not record query strings
++//
++// VITE_ORG_ID / VITE_USER_ID remain ONLY as a development escape hatch for the
++// load harness. The backend ignores them unless APP_ENV=development, so
++// leaving them set cannot weaken a deployed environment.
+ const DEV_ORG_ID = import.meta.env.VITE_ORG_ID || "";
+ const DEV_USER_ID = import.meta.env.VITE_USER_ID || "";
+ 
+@@ -48,10 +60,7 @@ function describeClose(event) {
+       return (
+         "Not authorised: " +
+         (reason || "the server rejected this identity.") +
+-        (DEV_ORG_ID
+-          ? ""
+-          : " No VITE_ORG_ID / VITE_USER_ID is configured — copy" +
+-            " frontend/.env.example to frontend/.env and restart Vite.")
++        (getStoredToken() ? " Sign out and sign in again." : " Sign in first.")
+       );
+     case CLOSE_TRY_AGAIN_LATER:
+       return (
+@@ -88,9 +97,17 @@ export function useAudioStream(wsUrl, onMessage) {
+     (speakers) => {
+       const url = new URL(wsUrl);
+       if (speakers > 0) url.searchParams.set("speakers", String(speakers));
++
+       // Identity. Sent on EVERY connection: the backend closes 1008 without it.
+-      if (DEV_ORG_ID) url.searchParams.set("organization_id", DEV_ORG_ID);
+-      if (DEV_USER_ID) url.searchParams.set("user_id", DEV_USER_ID);
++      const token = getStoredToken();
++      if (token) {
++        url.searchParams.set("token", token);
++      } else if (DEV_ORG_ID && DEV_USER_ID) {
++        // Development harness only. Ignored by the backend outside
++        // APP_ENV=development, where DevPrincipalResolver refuses to start.
++        url.searchParams.set("organization_id", DEV_ORG_ID);
++        url.searchParams.set("user_id", DEV_USER_ID);
++      }
+       return url.toString();
+     },
+     [wsUrl],
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index b91620d..2581e1a 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -1,10 +1,36 @@
+ import React from "react";
+ import ReactDOM from "react-dom/client";
+ import App from "./App.jsx";
++import AuthScreen from "./auth/AuthScreen.jsx";
++import { AuthProvider, useAuth } from "./auth/AuthContext.jsx";
+ import "./index.css";
+ 
++/**
++ * The gate lives here rather than inside App so App keeps its single job:
++ * running one transcription session. It never has to ask whether there is a
++ * user, because it does not mount until there is one.
++ */
++function Gate() {
++  const { user, loading } = useAuth();
++
++  if (loading) {
++    // Shown only while /auth/me resolves an existing token. Rendering the
++    // sign-in form first would flash a login screen at someone who is
++    // already signed in.
++    return (
++      <div className="flex h-full items-center justify-center bg-neutral-50">
++        <span className="text-sm text-neutral-400">Loading…</span>
++      </div>
++    );
++  }
++
++  return user ? <App /> : <AuthScreen />;
++}
++
+ ReactDOM.createRoot(document.getElementById("root")).render(
+   <React.StrictMode>
+-    <App />
+-  </React.StrictMode>
++    <AuthProvider>
++      <Gate />
++    </AuthProvider>
++  </React.StrictMode>,
+ );
