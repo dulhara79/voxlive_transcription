@@ -174,6 +174,16 @@ async def transcribe(ws: WebSocket) -> None:
 
                     if msg.get("bytes") is not None:
                         await session.feed_audio(msg["bytes"])
+                        if session.limit_reached:
+                            # The plan's per-session ceiling was hit and the
+                            # transcript has already been drained and sent.
+                            # Reading further frames would burn CPU decoding
+                            # audio that is guaranteed to be discarded.
+                            await ws.close(
+                                code=WS_TRY_AGAIN_LATER,
+                                reason="session length limit reached",
+                            )
+                            break
 
                     elif msg.get("text") == "stop":
                         await session.finish()
