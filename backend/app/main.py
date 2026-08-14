@@ -46,6 +46,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .api.routes_auth import router as auth_router
 from .api.routes_health import router as health_router
 from .api.routes_ws import router as ws_router
 from .asr.postprocess import PostProcessor
@@ -94,6 +95,7 @@ def build_provider():
         project=settings.google_cloud_project,
         location=settings.google_cloud_location,
         max_words_per_sec=settings.max_words_per_sec,
+        max_chars_per_sec=settings.max_chars_per_sec,
         thinking_budget=settings.gemini_thinking_budget,
     )
 
@@ -169,6 +171,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(health_router)
+    app.include_router(auth_router)
     app.include_router(ws_router)
     return app
 
