@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { getStoredToken } from "../auth/AuthContext.jsx";
 
 // Streams 16 kHz mono Int16 PCM to the backend over a WebSocket, from one of
 // two sources:
@@ -29,8 +30,19 @@ const TARGET_SAMPLE_RATE = 16000;
 const STOP_FLUSH_TIMEOUT_MS = 20000;
 const LEVEL_UPDATE_MS = 100;
 
-// Development identity. Matches the seeded tenants in
-// backend/app/tenant/seed.py. Cognito replaces this entirely.
+// Identity now comes from the signed token issued by POST /auth/login. It is
+// read at CONNECT time rather than captured in a closure, so a session that
+// was refreshed while the page stayed open uses the current token.
+//
+// The token travels as ?token= because the browser WebSocket API cannot set
+// an Authorization header. Two deployment consequences follow, and both are
+// requirements rather than hardening:
+//   * keep AUTH_ACCESS_TTL_SEC short — URLs reach history and proxy logs
+//   * ALB access logging must not record query strings
+//
+// VITE_ORG_ID / VITE_USER_ID remain ONLY as a development escape hatch for the
+// load harness. The backend ignores them unless APP_ENV=development, so
+// leaving them set cannot weaken a deployed environment.
 const DEV_ORG_ID = import.meta.env.VITE_ORG_ID || "";
 const DEV_USER_ID = import.meta.env.VITE_USER_ID || "";
 
@@ -48,10 +60,7 @@ function describeClose(event) {
       return (
         "Not authorised: " +
         (reason || "the server rejected this identity.") +
-        (DEV_ORG_ID
-          ? ""
-          : " No VITE_ORG_ID / VITE_USER_ID is configured — copy" +
-            " frontend/.env.example to frontend/.env and restart Vite.")
+        (getStoredToken() ? " Sign out and sign in again." : " Sign in first.")
       );
     case CLOSE_TRY_AGAIN_LATER:
       return (
@@ -88,9 +97,17 @@ export function useAudioStream(wsUrl, onMessage) {
     (speakers) => {
       const url = new URL(wsUrl);
       if (speakers > 0) url.searchParams.set("speakers", String(speakers));
+
       // Identity. Sent on EVERY connection: the backend closes 1008 without it.
-      if (DEV_ORG_ID) url.searchParams.set("organization_id", DEV_ORG_ID);
-      if (DEV_USER_ID) url.searchParams.set("user_id", DEV_USER_ID);
+      const token = getStoredToken();
+      if (token) {
+        url.searchParams.set("token", token);
+      } else if (DEV_ORG_ID && DEV_USER_ID) {
+        // Development harness only. Ignored by the backend outside
+        // APP_ENV=development, where DevPrincipalResolver refuses to start.
+        url.searchParams.set("organization_id", DEV_ORG_ID);
+        url.searchParams.set("user_id", DEV_USER_ID);
+      }
       return url.toString();
     },
     [wsUrl],
