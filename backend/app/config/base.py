@@ -76,6 +76,10 @@ class Settings:
     # ---- anti-hallucination guards ----
     min_segment_rms: int = int(os.getenv("MIN_SEGMENT_RMS", "120"))
     max_words_per_sec: float = float(os.getenv("MAX_WORDS_PER_SEC", "8.0"))
+    # Companion to MAX_WORDS_PER_SEC. Sinhala and Tamil agglutinate, so a
+    # runaway segment in either stays well under the WORD limit while its
+    # character count explodes. ~28 c/s is roughly double a fast speaker.
+    max_chars_per_sec: float = float(os.getenv("MAX_CHARS_PER_SEC", "28.0"))
 
     # ---- audio / VAD segmentation ----
     sample_rate: int = int(os.getenv("SAMPLE_RATE", "16000"))
