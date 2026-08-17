@@ -1,0 +1,539 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 4c75e63..f57fc5d 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -58,6 +58,26 @@ SOFT_MAX_SEGMENT_MS=3500
+ MAX_SEGMENT_MS=9000
+ MIN_SEGMENT_MS=300
+ 
++# SEGMENT LENGTH IS A DIARIZATION SETTING TOO
++# -------------------------------------------
++# A segment is the smallest unit that can carry a speaker name, so a segment
++# spanning a turn change can only ever be shown as one speaker. In continuous
++# conversation (a podcast, an interview) the "soft gap" the segmenter waits for
++# may not arrive for many seconds, so segments run to MAX_SEGMENT_MS and
++# routinely contain both people.
++#
++# The two settings above therefore trade ASR quality against diarization
++# resolution, in opposite directions:
++#
++#   longer segments   better ASR context, worse speaker resolution
++#   shorter segments  more speaker detail, more fragments for Gemini to
++#                     "complete" -- which is the hallucination mechanism
++#
++# Note that SILENCE_MS=450 (raised from 320 to test the Sinhala hypothesis)
++# pushes in the LONGER direction. If the session-end log reports a high unsplit
++# count, try MAX_SEGMENT_MS=6000 and SILENCE_MS=320 and compare -- but change
++# one at a time, and judge ASR and diarization separately.
++
+ # ---- Rolling ASR context ----
+ # Sent to the model as a spelling/vocabulary hint on every call. It is now
+ # AUDITED on the way back: if the returned text is mostly a copy of this hint,
+@@ -116,9 +136,20 @@ MAX_SPEAKERS=6
+ # windows of audio.
+ DIARIZE_INTERVAL_SEC=1.5
+ 
+-# How long a finished segment waits for the timeline to reach it before
+-# shipping with a best-effort label. A `refresh` corrects it either way, so
+-# this only buys a nicer first paint. Keep it under the pass interval.
++# How long a finished segment waits for the timeline to reach it.
++#
++# THIS IS NOT COSMETIC, AND THE OLD COMMENT HERE WAS WRONG. It used to say the
++# wait "only buys a nicer first paint" because a refresh corrects the label
++# either way. A refresh corrects WHO a paragraph belongs to; it cannot divide a
++# paragraph. The cut points come from the timeline at the moment the segment is
++# split, before ASR, and are never revised. So if the timeline has not reached
++# the segment, a stretch of audio containing two speakers becomes ONE paragraph
++# under ONE name, permanently.
++#
++# The wait now runs a diarization pass itself instead of waiting for the
++# background loop to get there, so it no longer has to be shorter than
++# DIARIZE_INTERVAL_SEC. Raise it if the session-end log reports unsplit
++# paragraphs; lower it if first paint feels laggy.
+ DIARIZE_WAIT_MS=900
+ 
+ # NOTE: DIARIZATION_THRESHOLD and DIARIZATION_NEW_SPEAKER_MARGIN are GONE.
+diff --git a/backend/app/diarization/service.py b/backend/app/diarization/service.py
+index a02d3e5..98aa7ea 100644
+--- a/backend/app/diarization/service.py
++++ b/backend/app/diarization/service.py
+@@ -151,7 +151,9 @@ class DiarizationService:
+ 
+     # -------------------------------------------------------------- one pass
+ 
+-    async def _pass(self, final: bool = False) -> None:
++    async def _pass(
++        self, final: bool = False, cover_until: Optional[float] = None
++    ) -> None:
+         async with self._lock:
+             if not self._pending:
+                 return
+@@ -160,7 +162,7 @@ class DiarizationService:
+             pcm = pcm.astype(np.float32) / 32768.0
+             offset = self._pending_offset
+             dur = len(pcm) / self.sample_rate
+-            if dur < 0.9 and not final:
++            if dur < 0.9 and not final and cover_until is None:
+                 return
+ 
+             regions = await asyncio.to_thread(
+@@ -174,10 +176,19 @@ class DiarizationService:
+             # Don't consume speech that is still in progress at the buffer
+             # edge: cutting a live sentence produces a stub window and, worse,
+             # a false turn boundary. Hold it back for the next pass.
++            #
++            # `cover_until` is the exception, and it is a narrow one. The
++            # caller is diarizing a segment the VAD has already CLOSED, so any
++            # region ending at or before that time is finished speech, not a
++            # sentence in progress — holding it back would only guarantee the
++            # timeline never reaches the segment that needs it. Regions past
++            # that time are still held back exactly as before.
+             keep_from = offset + dur
+             if regions and not final:
+                 last_a, last_b = regions[-1]
+-                if last_b >= offset + dur - 0.05:
++                at_edge = last_b >= offset + dur - 0.05
++                finished = cover_until is not None and last_b <= cover_until + 0.05
++                if at_edge and not finished:
+                     regions = regions[:-1]
+                     keep_from = last_a
+                 else:
+@@ -240,27 +251,68 @@ class DiarizationService:
+         if not self.enabled:
+             return
+         await self._pass(final=True)
+-        changed = await get_scheduler().run(self.engine.recluster)
++        # force=True. Without it, `recluster()` only re-derives clusters when
++        # RECLUSTER_AFTER_SEC (4 s) of new TRUSTED audio has arrived since the
++        # last derivation. At the end of a session the final flush usually adds
++        # far less than that, so the "final offline pass" was frequently
++        # relabelling against centroids derived several seconds of speech ago
++        # and skipping the whole-session re-derivation it exists to perform.
++        changed = await get_scheduler().run(self.engine.recluster, True)
+         if changed and self.on_change:
+             await self.on_change()
+ 
+     # ------------------------------------------------------------------ query
+ 
+     async def wait_for_coverage(self, until: float, timeout: float = 0.9) -> bool:
+-        """Block briefly until the timeline reaches `until` seconds.
+-
+-        Bounded on purpose. Waiting a few hundred ms so the FIRST render of a
+-        line already carries the right name is worth it; waiting a second and
+-        a half is not, because a `refresh` will fix it anyway.
++        """Extend the timeline to `until` seconds, if it can be done quickly.
++
++        WHY THIS RUNS A PASS INSTEAD OF WAITING FOR ONE
++        -----------------------------------------------
++        The caller is `SessionState.handle_segment`, and what it does with the
++        answer is decide WHERE TO CUT the segment (`_split` -> `split_points`).
++        Those cuts are made once, before ASR, and the chunk boundaries they
++        produce are never revised afterwards — `relabel()` can change who a
++        chunk belongs to, but it cannot divide a chunk that turned out to hold
++        two speakers. So a segment that is split while the timeline does not
++        yet reach it stays a single mono-speaker paragraph for the rest of the
++        session, and no amount of re-clustering repairs it.
++
++        The old implementation could not deliver that coverage. It poked the
++        background loop and polled, but a pass deliberately HOLDS BACK the
++        speech region touching the buffer edge (see `_pass`), which is exactly
++        the region a just-ended segment occupies. So the timeline reached the
++        segment only after the NEXT pass, while the default timeout (900 ms)
++        was shorter than the pass interval (1.5 s) — the wait timed out far
++        more often than it succeeded, and long segments went unsplit.
++
++        Running a flush pass here is safe precisely because the caller has a
++        FINISHED segment: the VAD has already seen the trailing silence, so the
++        speech is complete and there is no live sentence to cut in half.
++
++        The poll afterwards is a fallback for the case where another pass held
++        the lock and covered the range concurrently.
+         """
+         if not self.enabled:
+             return False
++        if self._covered_until >= until:
++            return True
++
+         deadline = time.monotonic() + timeout
++        try:
++            # Not wrapped in wait_for: cancelling mid-pass would drop windows
++            # that `_pass` has already consumed from `_pending`, leaving a
++            # permanent hole in the timeline. Better to overshoot the timeout
++            # slightly than to lose coverage.
++            await self._pass(cover_until=until)
++        except DiarizationQueueFull as exc:
++            log.debug("coverage pass skipped: %s", exc)
++        except Exception as exc:  # noqa: BLE001
++            log.warning("coverage pass failed: %s", exc)
++
+         while self._covered_until < until:
+             left = deadline - time.monotonic()
+             if left <= 0:
+                 return False
+-            self._wake.set()
+             try:
+                 await asyncio.wait_for(self._coverage.wait(), timeout=min(left, 0.25))
+             except asyncio.TimeoutError:
+diff --git a/backend/app/session/state.py b/backend/app/session/state.py
+index f460de7..523cba3 100644
+--- a/backend/app/session/state.py
++++ b/backend/app/session/state.py
+@@ -386,6 +386,22 @@ class SessionState:
+                 extra={"session_id": self.session_id},
+             )
+ 
++        blended, blended_sec = self.store.unsplit_chunks(self.diar.timeline())
++        if blended:
++            log.warning(
++                "%d paragraph(s) (%.1fs) contain a speaker change that could "
++                "not be split: the timeline did not cover them when they were "
++                "cut. Shorten segments (SILENCE_MS / SOFT_MAX_SEGMENT_MS / "
++                "MAX_SEGMENT_MS) if this stays high.",
++                blended,
++                blended_sec,
++                extra={
++                    "session_id": self.session_id,
++                    "event": "diarization_unsplit",
++                    "unsplit_chunks": blended,
++                },
++            )
++
+         log.info(
+             "session done: %s",
+             self.diar.stats(),
+diff --git a/backend/app/session/transcript.py b/backend/app/session/transcript.py
+index 53ebdd1..18698c8 100644
+--- a/backend/app/session/transcript.py
++++ b/backend/app/session/transcript.py
+@@ -102,6 +102,37 @@ class TranscriptStore:
+                 last = s
+         return changed
+ 
++    def unsplit_chunks(self, timeline) -> tuple[int, float]:
++        """Chunks the timeline says hold a speaker change. `(count, seconds)`.
++
++        A DIAGNOSTIC, not a repair. Chunk boundaries are decided once, before
++        ASR, from whatever the timeline knew then; `relabel()` can move a chunk
++        to a different speaker but cannot divide one. So if the final timeline
++        shows a turn change INSIDE a chunk, that chunk's text is a blend of two
++        people and will be shown under a single name no matter how good the
++        clustering gets.
++
++        The text cannot be split retroactively — Gemini returns a string with
++        no word timings, so there is nothing to cut it on. What this number is
++        for is telling you how much of the diarization error you are looking at
++        is clustering (fixable by tuning) versus segmentation (fixable only by
++        producing shorter chunks in the first place, via SILENCE_MS,
++        SOFT_MAX_SEGMENT_MS and MAX_SEGMENT_MS).
++        """
++        runs = [r for r in timeline if r[2] is not None]
++        if not runs:
++            return 0, 0.0
++        count = 0
++        seconds = 0.0
++        for c in self.chunks:
++            if not c.text:
++                continue
++            inside = {s for a, b, s in runs if b > c.start + 0.35 and a < c.end - 0.35}
++            if len(inside) > 1:
++                count += 1
++                seconds += c.end - c.start
++        return count, round(seconds, 1)
++
+     # ------------------------------------------------------------- paragraphs
+ 
+     def paragraphs(self) -> list[dict]:
+@@ -141,7 +172,16 @@ class TranscriptStore:
+             # A paragraph can legitimately be code-switched: Sinhala, then an
+             # English clause, then back. Report the mix rather than pretending
+             # the last chunk's language was the whole paragraph's.
+-            p["language"] = langs[0] if len(langs) <= 1 else "+".join(langs)
++            #
++            # `langs` can be EMPTY: it is only appended to when a chunk carries
++            # a non-empty `language`, so a paragraph built entirely from chunks
++            # with a blank language left this list empty and `langs[0]` raised
++            # IndexError — taking down the whole transcript render, not just
++            # that paragraph. The normal ASR path always sets a language, which
++            # is why this has not fired in production; anything that sets text
++            # without one (a test, a future provider, a postprocess stage)
++            # would hit it.
++            p["language"] = langs[0] if len(langs) == 1 else "+".join(langs)
+         return out
+ 
+     def diff(self) -> tuple[list[dict], str]:
+diff --git a/backend/tests/test_diarization_coverage.py b/backend/tests/test_diarization_coverage.py
+new file mode 100644
+index 0000000..5de1720
+--- /dev/null
++++ b/backend/tests/test_diarization_coverage.py
+@@ -0,0 +1,270 @@
++"""Diarization coverage: the timeline must reach a segment BEFORE it is cut.
++
++WHY THIS FILE EXISTS
++--------------------
++`SessionState._split` asks the diarizer for speaker-change times and cuts the
++segment there. That happens once, before ASR, and the resulting chunk
++boundaries are never revised — `relabel()` can move a chunk to another speaker
++but cannot divide one. So if the timeline does not reach the segment at the
++moment it is cut, a segment containing two speakers becomes one mono-speaker
++paragraph permanently, and the final offline pass cannot repair it.
++
++That is the non-overlap diarization failure. These tests pin the mechanism.
++
++No model is loaded: `Embedder` imports pyannote lazily inside `_load`, so
++`embed_batch` can be replaced with a deterministic fake.
++"""
++
++import asyncio
++import os
++import sys
++
++import numpy as np
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++os.environ.setdefault("DIARIZATION_MODE", "off")
++os.environ.setdefault("GEMINI_API_KEY", "test-key")
++os.environ.setdefault("APP_ENV", "development")
++
++from app.diarization.service import DiarizationService
++from app.session.transcript import TranscriptStore
++
++SR = 16000
++DIM = 32
++
++
++def _voice(seed: int) -> np.ndarray:
++    """A fixed, well-separated unit vector standing in for a speaker."""
++    v = np.zeros(DIM, dtype=np.float64)
++    v[seed] = 1.0
++    return v
++
++
++def two_speaker_pcm(seconds=12.0, turn=3.0) -> bytes:
++    """Speech-like audio that webrtcvad detects for its whole duration.
++
++    Speaker identity here comes from the fake embeddings (assigned by window
++    start time), not from the waveform — so the signal only has to clear the
++    VAD. A plain low tone does NOT: webrtcvad rejected the 130 Hz burst used in
++    an earlier version of this fixture, which silently removed the first turn
++    from every region and made the test measure the fixture, not the code.
++    """
++    n = int(seconds * SR)
++    t = np.arange(n) / SR
++    v = sum(np.sin(2 * np.pi * 180 * k * t) / k for k in range(1, 8))
++    env = 0.5 + 0.5 * np.sin(2 * np.pi * 5 * t)
++    return (v * env * 0.5 * 32767 * 0.6).astype(np.int16).tobytes()
++
++
++def fake_service(**kw) -> DiarizationService:
++    """A service whose embeddings depend only on WHEN a window occurs.
++
++    Windows in even 3 s slots get voice A, odd slots voice B. That makes the
++    expected timeline knowable exactly, so a test can assert on coverage rather
++    than on whatever a real model happens to think.
++    """
++    svc = DiarizationService(
++        hf_token="fake",
++        sample_rate=SR,
++        expected_speakers=2,
++        interval_sec=1.5,
++        enabled=True,
++        **kw,
++    )
++    svc._spans: list = []
++
++    def embed_batch(windows):
++        out = []
++        for _ in windows:
++            out.append(None)
++        return out
++
++    svc.embedder.embed_batch = embed_batch
++    return svc
++
++
++def timed_service() -> DiarizationService:
++    """As above, but embeddings are chosen from each window's START TIME."""
++    svc = DiarizationService(
++        hf_token="fake",
++        sample_rate=SR,
++        expected_speakers=2,
++        interval_sec=1.5,
++        enabled=True,
++    )
++
++    original = svc.engine.add_windows
++
++    def add_windows(windows):
++        for w in windows:
++            slot = int(w.start // 3.0) % 2
++            w.embedding = _voice(0 if slot == 0 else 1)
++        original(windows)
++
++    svc.engine.add_windows = add_windows
++    svc.embedder.embed_batch = lambda windows: [_voice(0) for _ in windows]
++    return svc
++
++
++# --------------------------------------------------- the coverage regression
++
++
++def test_coverage_reaches_a_finished_segment():
++    """wait_for_coverage must extend the timeline over a CLOSED segment.
++
++    Before the fix this returned False almost every time: `_pass` held back the
++    speech region touching the buffer edge — which is precisely where a
++    just-ended segment sits — and the caller's 900 ms timeout was shorter than
++    the 1.5 s pass interval, so the next pass had not run yet.
++    """
++
++    async def go():
++        svc = timed_service()
++        pcm = two_speaker_pcm(seconds=9.0)
++        svc.feed(pcm)
++        # No background loop started: this is exactly the case the old code
++        # could not serve, because it could only wait for someone else's pass.
++        # 9.0 == the end of the finished segment, which is what
++        # handle_segment actually asks for.
++        covered = await svc.wait_for_coverage(9.0, timeout=5.0)
++        return covered, svc._covered_until, svc.engine.timeline()
++
++    covered, until, timeline = asyncio.run(go())
++    assert covered is True
++    assert until >= 8.0
++    assert timeline
++
++
++def test_split_points_found_across_a_turn_change():
++    """With coverage, the cut the session needs actually exists."""
++
++    async def go():
++        svc = timed_service()
++        svc.feed(two_speaker_pcm(seconds=12.0))
++        await svc.wait_for_coverage(12.0, timeout=5.0)
++        return svc.split_points(0.0, 11.0), svc.engine.speaker_count()
++
++    cuts, speakers = asyncio.run(go())
++    assert speakers == 2
++    # Turns change at 3 s, 6 s, 9 s. Exact times depend on VAD framing, so
++    # assert that cuts exist and land near a boundary rather than on equality.
++    assert cuts, "no speaker-change cuts found — segments would go unsplit"
++    assert any(abs(c - b) < 1.0 for c in cuts for b in (3.0, 6.0, 9.0))
++
++
++def test_in_progress_speech_is_still_held_back():
++    """The flush must not consume a sentence that has not finished.
++
++    `cover_until` is allowed to release only regions that END at or before the
++    caller's finished segment. Anything later is still held for the next pass —
++    cutting live speech is what produces stub windows and false boundaries.
++    """
++
++    async def go():
++        svc = timed_service()
++        svc.feed(two_speaker_pcm(seconds=9.0))
++        # Ask only for the first 3 s. The speech running to the buffer edge
++        # must not be consumed.
++        await svc.wait_for_coverage(3.0, timeout=5.0)
++        return svc._pending_offset
++
++    offset = asyncio.run(go())
++    assert offset < 9.0
++
++
++def test_disabled_service_reports_no_coverage():
++    async def go():
++        svc = DiarizationService(hf_token="fake", sample_rate=SR, enabled=False)
++        return await svc.wait_for_coverage(5.0, timeout=0.1)
++
++    assert asyncio.run(go()) is False
++
++
++# ------------------------------------------------------- the final-pass fix
++
++
++def test_finalize_forces_a_full_recluster():
++    """`finalize()` must re-derive clusters, not reuse stale centroids.
++
++    `recluster()` only re-derives after RECLUSTER_AFTER_SEC (4 s) of new
++    trusted audio. The final flush usually adds less than that, so without
++    force=True the "best labelling the system can produce" quietly skipped the
++    whole-session re-derivation it exists to perform.
++    """
++    seen = {}
++
++    async def go():
++        svc = timed_service()
++        svc.feed(two_speaker_pcm(seconds=9.0))
++        await svc.wait_for_coverage(9.0, timeout=5.0)
++
++        original = svc.engine.recluster
++
++        def spy(force=False):
++            seen["force"] = force
++            return original(force=force)
++
++        svc.engine.recluster = spy
++        await svc.finalize()
++
++    asyncio.run(go())
++    assert seen.get("force") is True
++
++
++# ------------------------------------------- the diagnostic for what remains
++
++
++def test_unsplit_chunk_is_detected():
++    """A chunk spanning a turn change is counted, because it cannot be fixed."""
++    store = TranscriptStore()
++    chunk = store.new_chunk(1, 0.0, 9.0)
++    chunk.text = "two people talking"
++    chunk.speaker = 0
++
++    timeline = [(0.0, 4.0, 0), (4.0, 9.0, 1)]
++    count, seconds = store.unsplit_chunks(timeline)
++
++    assert count == 1
++    assert seconds == pytest.approx(9.0)
++
++
++def test_correctly_split_chunks_are_not_counted():
++    store = TranscriptStore()
++    a = store.new_chunk(1, 0.0, 4.0)
++    a.text = "first speaker"
++    b = store.new_chunk(1, 4.0, 9.0)
++    b.text = "second speaker"
++
++    timeline = [(0.0, 4.0, 0), (4.0, 9.0, 1)]
++    count, seconds = store.unsplit_chunks(timeline)
++
++    assert count == 0
++    assert seconds == 0.0
++
++
++def test_unsplit_ignores_chunks_with_no_text():
++    store = TranscriptStore()
++    store.new_chunk(1, 0.0, 9.0)  # dropped by a guard, never transcribed
++    assert store.unsplit_chunks([(0.0, 4.0, 0), (4.0, 9.0, 1)]) == (0, 0.0)
++
++
++def test_relabel_cannot_divide_a_chunk():
++    """Pins the limitation the diagnostic reports, so it stays documented.
++
++    This is the reason coverage has to be right BEFORE the cut: afterwards,
++    the best the system can do is pick which of the two speakers gets the
++    whole paragraph.
++    """
++    store = TranscriptStore()
++    c = store.new_chunk(1, 0.0, 9.0)
++    c.text = "A talking then B talking"
++
++    def lookup(start, end):
++        return 0 if start < 4.0 else 1
++
++    store.relabel(lookup)
++    paras = store.paragraphs()
++
++    assert len(paras) == 1
++    assert paras[0]["speaker"] == "Speaker 1"
