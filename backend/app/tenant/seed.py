@@ -67,8 +67,16 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
         plan_code="starter",
         status=OrganizationStatus.SUSPENDED,
     )
+    # Skip anything already present. This mattered nothing while the
+    # repository was a dictionary that started empty every boot; against a
+    # persistent store, re-saving unconditionally would overwrite whatever the
+    # row holds NOW with the fixture values on every restart — including a
+    # password an owner had changed, or a plan a test had moved.
+    created_orgs = 0
     for org in (acme, globex, suspended):
-        await repo.save_organization(org)
+        if await repo.get_organization(org.id) is None:
+            await repo.save_organization(org)
+            created_orgs += 1
 
     users = [
         User(
@@ -118,7 +126,17 @@ async def seed_development_tenants(repo: TenantRepository) -> None:
             cognito_sub="dev-sub-erin",
         ),
     ]
+    created_users = 0
     for user in users:
-        await repo.save_user(user)
+        if await repo.get_user(user.id, user.organization_id) is None:
+            await repo.save_user(user)
+            created_users += 1
 
-    log.info("seeded %d development organization(s), %d user(s)", 3, len(users))
+    if created_orgs or created_users:
+        log.info(
+            "seeded %d development organization(s), %d user(s)",
+            created_orgs,
+            created_users,
+        )
+    else:
+        log.info("development fixtures already present; nothing seeded")
