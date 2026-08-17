@@ -94,9 +94,21 @@ def _secret() -> str:
 
 
 def _resolve_secret(app_env: str) -> str:
-    """Shared body. Absent in development, a stable per-process value is
-    generated: every restart invalidates existing tokens, which is annoying on
-    a laptop and correct everywhere else.
+    """Shared body.
+
+    Absent in development, a key is read from (or written to) a local file
+    rather than generated per process. The previous behaviour generated a new
+    random key at every start-up, which meant a backend restart silently
+    invalidated every token already in a browser's localStorage: the user was
+    signed out, `/auth/me` returned 401, and the only visible symptom was
+    "I have to log in again every time I restart the server". Nothing was
+    wrong with the token or the account — the key that signed it no longer
+    existed.
+
+    Outside development this path is never reached: an unset AUTH_JWT_SECRET
+    still raises, because two ECS tasks generating their own keys would reject
+    each other's tokens and logins would fail at random behind the load
+    balancer.
     """
     secret = os.getenv("AUTH_JWT_SECRET", "").strip()
     if secret:
@@ -120,13 +132,71 @@ def _resolve_secret(app_env: str) -> str:
 
 _DEV_SECRET: Optional[str] = None
 
+# Where the development key is kept when AUTH_JWT_SECRET is unset. Add this to
+# .gitignore — it is a credential, even if only a local one.
+DEV_SECRET_FILE = os.getenv("AUTH_DEV_SECRET_FILE", ".voxlive_dev_secret")
+
 
 def _dev_secret() -> str:
-    global _DEV_SECRET
-    if _DEV_SECRET is None:
-        import secrets
+    """A development signing key that OUTLIVES the process.
 
-        _DEV_SECRET = secrets.token_urlsafe(48)
+    Order of preference:
+        1. the value already read in this process (no repeated file I/O)
+        2. the contents of DEV_SECRET_FILE, if it exists and looks usable
+        3. a freshly generated key, written to that file for next time
+
+    Step 3 falls back to an in-process key if the file cannot be written (a
+    read-only working directory, a locked-down container). That restores the
+    old sign-out-on-restart behaviour rather than refusing to start, and it
+    says so in the log so the cause is not a mystery.
+    """
+    global _DEV_SECRET
+    if _DEV_SECRET is not None:
+        return _DEV_SECRET
+
+    import logging
+    import secrets
+
+    log = logging.getLogger("voxlive.auth")
+    path = DEV_SECRET_FILE
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            existing = handle.read().strip()
+        if len(existing) >= 32:
+            _DEV_SECRET = existing
+            log.info("auth: reusing the development signing key from %s", path)
+            return _DEV_SECRET
+        log.warning("auth: %s is too short to use; generating a new key", path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("auth: could not read %s (%s); generating a new key", path, exc)
+
+    generated = secrets.token_urlsafe(48)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(generated)
+        try:
+            # Best effort: a no-op on Windows, which is a normal place to run
+            # this, so it must not be fatal.
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        log.info(
+            "auth: generated a development signing key and saved it to %s "
+            "(tokens now survive a restart; delete the file to sign everyone out)",
+            path,
+        )
+    except OSError as exc:
+        log.warning(
+            "auth: could not write %s (%s) — falling back to a per-process key, "
+            "so restarting the backend will sign you out again",
+            path,
+            exc,
+        )
+
+    _DEV_SECRET = generated
     return _DEV_SECRET
 
 
