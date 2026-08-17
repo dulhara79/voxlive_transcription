@@ -102,6 +102,37 @@ class TranscriptStore:
                 last = s
         return changed
 
+    def unsplit_chunks(self, timeline) -> tuple[int, float]:
+        """Chunks the timeline says hold a speaker change. `(count, seconds)`.
+
+        A DIAGNOSTIC, not a repair. Chunk boundaries are decided once, before
+        ASR, from whatever the timeline knew then; `relabel()` can move a chunk
+        to a different speaker but cannot divide one. So if the final timeline
+        shows a turn change INSIDE a chunk, that chunk's text is a blend of two
+        people and will be shown under a single name no matter how good the
+        clustering gets.
+
+        The text cannot be split retroactively — Gemini returns a string with
+        no word timings, so there is nothing to cut it on. What this number is
+        for is telling you how much of the diarization error you are looking at
+        is clustering (fixable by tuning) versus segmentation (fixable only by
+        producing shorter chunks in the first place, via SILENCE_MS,
+        SOFT_MAX_SEGMENT_MS and MAX_SEGMENT_MS).
+        """
+        runs = [r for r in timeline if r[2] is not None]
+        if not runs:
+            return 0, 0.0
+        count = 0
+        seconds = 0.0
+        for c in self.chunks:
+            if not c.text:
+                continue
+            inside = {s for a, b, s in runs if b > c.start + 0.35 and a < c.end - 0.35}
+            if len(inside) > 1:
+                count += 1
+                seconds += c.end - c.start
+        return count, round(seconds, 1)
+
     # ------------------------------------------------------------- paragraphs
 
     def paragraphs(self) -> list[dict]:
@@ -141,7 +172,16 @@ class TranscriptStore:
             # A paragraph can legitimately be code-switched: Sinhala, then an
             # English clause, then back. Report the mix rather than pretending
             # the last chunk's language was the whole paragraph's.
-            p["language"] = langs[0] if len(langs) <= 1 else "+".join(langs)
+            #
+            # `langs` can be EMPTY: it is only appended to when a chunk carries
+            # a non-empty `language`, so a paragraph built entirely from chunks
+            # with a blank language left this list empty and `langs[0]` raised
+            # IndexError — taking down the whole transcript render, not just
+            # that paragraph. The normal ASR path always sets a language, which
+            # is why this has not fired in production; anything that sets text
+            # without one (a test, a future provider, a postprocess stage)
+            # would hit it.
+            p["language"] = langs[0] if len(langs) == 1 else "+".join(langs)
         return out
 
     def diff(self) -> tuple[list[dict], str]:
