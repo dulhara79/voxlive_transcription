@@ -386,6 +386,22 @@ class SessionState:
                 extra={"session_id": self.session_id},
             )
 
+        blended, blended_sec = self.store.unsplit_chunks(self.diar.timeline())
+        if blended:
+            log.warning(
+                "%d paragraph(s) (%.1fs) contain a speaker change that could "
+                "not be split: the timeline did not cover them when they were "
+                "cut. Shorten segments (SILENCE_MS / SOFT_MAX_SEGMENT_MS / "
+                "MAX_SEGMENT_MS) if this stays high.",
+                blended,
+                blended_sec,
+                extra={
+                    "session_id": self.session_id,
+                    "event": "diarization_unsplit",
+                    "unsplit_chunks": blended,
+                },
+            )
+
         log.info(
             "session done: %s",
             self.diar.stats(),
