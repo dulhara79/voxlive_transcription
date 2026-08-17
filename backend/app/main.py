@@ -58,8 +58,9 @@ from .diarization.factory import warmup_backend
 from .observability.logging import configure_logging
 from .session.manager import SessionManager
 from .tenant.quotas import AdmissionController, CapacityManager, QuotaManager
-from .tenant.repository import InMemoryTenantRepository
+from .tenant.repository import InMemoryTenantRepository, TenantRepository
 from .tenant.seed import seed_development_tenants
+from .tenant.sqlite_repository import SqliteTenantRepository
 
 log = logging.getLogger("voxlive")
 
@@ -76,6 +77,49 @@ def _float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def build_tenant_repository() -> TenantRepository:
+    """Choose where organizations and users live, from DATABASE_URL.
+
+        DATABASE_URL=sqlite:///./voxlive.db   file-backed  (development default)
+        DATABASE_URL=memory                   dictionaries (tests only)
+
+    The default is a FILE, not memory. That is the whole point of this
+    function: with an in-memory repository, every backend restart discarded
+    every registered account, so local testing meant signing up again after
+    each `uvicorn --reload` cycle.
+
+    `memory` stays available and is what the test suite selects, because tests
+    want a repository that starts empty and leaves nothing behind on disk.
+
+    A `postgresql://` URL is REJECTED rather than quietly downgraded: a
+    SqlTenantRepository does not exist yet, and silently serving a production
+    URL from a local SQLite file is the kind of thing that is only discovered
+    after data has been written to the wrong place.
+    """
+    url = os.getenv("DATABASE_URL", "").strip()
+
+    if url.lower() in ("memory", "memory://", "sqlite:///:memory:"):
+        log.info("tenant storage: in-memory (nothing survives a restart)")
+        return InMemoryTenantRepository()
+
+    if not url:
+        url = "sqlite:///./voxlive.db"
+
+    lowered = url.lower()
+    if lowered.startswith("sqlite:"):
+        # sqlite:///./voxlive.db  ->  ./voxlive.db
+        path = url.split("://", 1)[1] if "://" in url else url
+        path = path.lstrip("/") if path.startswith("///") else path.lstrip("/")
+        return SqliteTenantRepository(path or "voxlive.db")
+
+    raise RuntimeError(
+        f"DATABASE_URL={url!r} is not supported. This build implements "
+        "'sqlite:///<path>' and 'memory'. PostgreSQL needs a "
+        "SqlTenantRepository, which does not exist yet — refusing to start "
+        "rather than writing your data somewhere you did not ask for."
+    )
 
 
 def build_provider():
@@ -127,10 +171,13 @@ async def lifespan(app: FastAPI):
     )
 
     # ---- multi-tenancy -----------------------------------------------------
-    # InMemoryTenantRepository today; the PostgreSQL commit swaps in
-    # SqlTenantRepository here and nothing else in the application changes.
-    app.state.tenants = InMemoryTenantRepository()
+    # Storage is chosen by DATABASE_URL, defaulting to a local SQLite file so
+    # accounts survive a restart. The PostgreSQL commit adds another branch to
+    # build_tenant_repository() and nothing else in the application changes.
+    app.state.tenants = build_tenant_repository()
     if APP_ENV == "development":
+        # Idempotent: existing rows are left alone, so a password you changed
+        # is not reset to the fixture value on the next boot.
         await seed_development_tenants(app.state.tenants)
 
     # Fails closed: outside development this raises until Cognito exists,
