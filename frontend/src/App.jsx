@@ -418,12 +418,18 @@ function SpeakerSelect({ speakers, setSpeakers, disabled }) {
         (disabled ? "opacity-50" : "")
       }
       title={
-        "Auto — estimate how many people are speaking.\n" +
-        "A number — assume EXACTLY that many speakers and never merge them.\n\n" +
-        "Pick a number when you know the count (a two-person interview): it stops " +
-        "two similar voices being collapsed into one speaker mid-recording.\n" +
-        "Pick Auto when you don't: assuming 2 while only one person speaks will " +
-        "split that person into two speakers."
+        'Auto — "I don\'t know how many people are in this recording."\n' +
+        "The count is estimated from the audio and a genuinely new voice can " +
+        "still be discovered mid-session. Use it for news, panels, meetings, " +
+        "anything unrehearsed.\n\n" +
+        'Exactly N — "I know there are exactly N people."\n' +
+        "The count is LOCKED at N. Speaker N+1 cannot be created no matter " +
+        "how many people actually speak, and if only one person speaks that " +
+        "person is split into N speakers. Use it for a two-person interview " +
+        "or a fixed studio setup, where it stops two similar voices being " +
+        "collapsed into one speaker mid-recording.\n\n" +
+        "If you are unsure, choose Auto. Exactly N is a promise about the " +
+        "audio, not a hint."
       }
     >
       <span className="hidden sm:inline">Speakers</span>
@@ -435,7 +441,7 @@ function SpeakerSelect({ speakers, setSpeakers, disabled }) {
       >
         {SPEAKER_CHOICES.map((n) => (
           <option key={n} value={n}>
-            {n === 0 ? "Auto" : `Exactly ${n}`}
+            {n === 0 ? "Auto — unknown count" : `Exactly ${n}`}
           </option>
         ))}
       </select>
