@@ -94,9 +94,15 @@ export function useAudioStream(wsUrl, onMessage) {
   const refusedRef = useRef(false);
 
   const buildUrl = useCallback(
-    (speakers) => {
+    (speakers, speakerMode) => {
       const url = new URL(wsUrl);
       if (speakers > 0) url.searchParams.set("speakers", String(speakers));
+      // auto  -> the backend estimates K; `speakers` is only a ceiling.
+      // fixed -> the backend uses EXACTLY `speakers` identities and will not
+      //          collapse them mid-session. Only meaningful with speakers > 0.
+      if (speakerMode === "fixed" && speakers > 0) {
+        url.searchParams.set("speaker_mode", "fixed");
+      }
 
       // Identity. Sent on EVERY connection: the backend closes 1008 without it.
       const token = getStoredToken();
@@ -114,14 +120,14 @@ export function useAudioStream(wsUrl, onMessage) {
   );
 
   const start = useCallback(
-    async (source = "mic", speakers = 0) => {
+    async (source = "mic", speakers = 0, speakerMode = "auto") => {
       setStatus("connecting");
       refusedRef.current = false;
 
       try {
         // 1) open the socket first. speakers>0 = the user KNOWS the count;
         // the backend caps diarization identities to exactly that many.
-        const ws = new WebSocket(buildUrl(speakers));
+        const ws = new WebSocket(buildUrl(speakers, speakerMode));
         ws.binaryType = "arraybuffer";
         wsRef.current = ws;
 
@@ -226,7 +232,8 @@ export function useAudioStream(wsUrl, onMessage) {
         ctxRef.current = ctx;
 
         console.log(
-          `[VoxLive] source=${source} speakers=${speakers || "auto"} ` +
+          `[VoxLive] source=${source} speakers=${speakers || "auto"}` +
+            `${speakers > 0 ? `/${speakerMode}` : ""} ` +
             `org=${DEV_ORG_ID || "(none)"} ` +
             `AudioContext sampleRate = ${ctx.sampleRate}` +
             (ctx.sampleRate === TARGET_SAMPLE_RATE
@@ -340,7 +347,28 @@ export function useAudioStream(wsUrl, onMessage) {
     setRecording(false);
   }, []);
 
+  const newRecording = useCallback(() => {
+    // Explicit NEW RECORDING (supervisor review §10/§11). Tells the backend to
+    // start an independent speaker universe WITHOUT stopping the session: the
+    // socket, the audio clock and the transcript all survive.
+    //
+    // This is a user action on purpose. There is no silence-triggered version,
+    // because a long pause in a conversation is not a new recording — an
+    // interviewee thinking for six seconds would otherwise be turned into a
+    // fresh set of speakers.
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send("new_recording");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }, []);
+
   stopRef.current = stop;
 
-  return { start, stop, recording, status, level };
+  return { start, stop, newRecording, recording, status, level };
 }
