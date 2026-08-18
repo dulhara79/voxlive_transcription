@@ -69,11 +69,25 @@ def resolve_backend(requested: str) -> str:
     return "embedding"
 
 
-def build_diarizer(settings, expected_speakers: int):
-    """Construct the configured backend for one session."""
+def build_diarizer(settings, expected_speakers: int, speaker_mode: str = ""):
+    """Construct the configured backend for one session.
+
+    `speaker_mode` is per-session ("auto" | "fixed"), sent by the client and
+    falling back to SPEAKER_MODE from .env. Only the embedding backend honours
+    it — Sortformer decides its own speaker count end-to-end and has no K to
+    force — so a fixed request is logged and ignored there rather than being
+    silently accepted.
+    """
     backend = resolve_backend(getattr(settings, "diarization_backend", "embedding"))
+    mode = (speaker_mode or getattr(settings, "speaker_mode", "auto") or "auto").lower()
 
     if backend == "sortformer":
+        if mode == "fixed":
+            log.warning(
+                "speaker_mode=fixed ignored: the Sortformer backend derives its "
+                "own speaker count and exposes no K to force. Use "
+                "DIARIZATION_BACKEND=embedding for a known speaker count."
+            )
         from .sortformer import SortformerDiarizer
 
         return SortformerDiarizer(
@@ -91,6 +105,8 @@ def build_diarizer(settings, expected_speakers: int):
         sample_rate=settings.sample_rate,
         expected_speakers=expected_speakers,
         max_speakers=settings.max_speakers,
+        speaker_mode=mode,
+        establish_sec=float(getattr(settings, "speaker_establish_sec", 8.0)),
         interval_sec=settings.diarize_interval_sec,
         vad_aggressiveness=settings.vad_aggressiveness,
         enabled=settings.diarization_enabled,
