@@ -69,6 +69,8 @@ class DiarizationService:
         sample_rate: int = 16000,
         expected_speakers: int = 0,
         max_speakers: int = 6,
+        speaker_mode: str = "auto",
+        establish_sec: float = 8.0,
         interval_sec: float = 1.5,
         vad_aggressiveness: int = 2,
         device: Optional[str] = None,
@@ -83,6 +85,8 @@ class DiarizationService:
         self.engine = SpeakerEngine(
             expected_speakers=expected_speakers,
             max_speakers=max_speakers,
+            speaker_mode=speaker_mode,
+            establish_sec=establish_sec,
             **engine_kw,
         )
         self.embedder = Embedder(hf_token, device=device, sample_rate=sample_rate)
@@ -151,7 +155,9 @@ class DiarizationService:
 
     # -------------------------------------------------------------- one pass
 
-    async def _pass(self, final: bool = False) -> None:
+    async def _pass(
+        self, final: bool = False, cover_until: Optional[float] = None
+    ) -> None:
         async with self._lock:
             if not self._pending:
                 return
@@ -160,7 +166,7 @@ class DiarizationService:
             pcm = pcm.astype(np.float32) / 32768.0
             offset = self._pending_offset
             dur = len(pcm) / self.sample_rate
-            if dur < 0.9 and not final:
+            if dur < 0.9 and not final and cover_until is None:
                 return
 
             regions = await asyncio.to_thread(
@@ -174,10 +180,19 @@ class DiarizationService:
             # Don't consume speech that is still in progress at the buffer
             # edge: cutting a live sentence produces a stub window and, worse,
             # a false turn boundary. Hold it back for the next pass.
+            #
+            # `cover_until` is the exception, and it is a narrow one. The
+            # caller is diarizing a segment the VAD has already CLOSED, so any
+            # region ending at or before that time is finished speech, not a
+            # sentence in progress — holding it back would only guarantee the
+            # timeline never reaches the segment that needs it. Regions past
+            # that time are still held back exactly as before.
             keep_from = offset + dur
             if regions and not final:
                 last_a, last_b = regions[-1]
-                if last_b >= offset + dur - 0.05:
+                at_edge = last_b >= offset + dur - 0.05
+                finished = cover_until is not None and last_b <= cover_until + 0.05
+                if at_edge and not finished:
                     regions = regions[:-1]
                     keep_from = last_a
                 else:
@@ -240,27 +255,68 @@ class DiarizationService:
         if not self.enabled:
             return
         await self._pass(final=True)
-        changed = await get_scheduler().run(self.engine.recluster)
+        # force=True. Without it, `recluster()` only re-derives clusters when
+        # RECLUSTER_AFTER_SEC (4 s) of new TRUSTED audio has arrived since the
+        # last derivation. At the end of a session the final flush usually adds
+        # far less than that, so the "final offline pass" was frequently
+        # relabelling against centroids derived several seconds of speech ago
+        # and skipping the whole-session re-derivation it exists to perform.
+        changed = await get_scheduler().run(self.engine.recluster, True)
         if changed and self.on_change:
             await self.on_change()
 
     # ------------------------------------------------------------------ query
 
     async def wait_for_coverage(self, until: float, timeout: float = 0.9) -> bool:
-        """Block briefly until the timeline reaches `until` seconds.
+        """Extend the timeline to `until` seconds, if it can be done quickly.
 
-        Bounded on purpose. Waiting a few hundred ms so the FIRST render of a
-        line already carries the right name is worth it; waiting a second and
-        a half is not, because a `refresh` will fix it anyway.
+        WHY THIS RUNS A PASS INSTEAD OF WAITING FOR ONE
+        -----------------------------------------------
+        The caller is `SessionState.handle_segment`, and what it does with the
+        answer is decide WHERE TO CUT the segment (`_split` -> `split_points`).
+        Those cuts are made once, before ASR, and the chunk boundaries they
+        produce are never revised afterwards — `relabel()` can change who a
+        chunk belongs to, but it cannot divide a chunk that turned out to hold
+        two speakers. So a segment that is split while the timeline does not
+        yet reach it stays a single mono-speaker paragraph for the rest of the
+        session, and no amount of re-clustering repairs it.
+
+        The old implementation could not deliver that coverage. It poked the
+        background loop and polled, but a pass deliberately HOLDS BACK the
+        speech region touching the buffer edge (see `_pass`), which is exactly
+        the region a just-ended segment occupies. So the timeline reached the
+        segment only after the NEXT pass, while the default timeout (900 ms)
+        was shorter than the pass interval (1.5 s) — the wait timed out far
+        more often than it succeeded, and long segments went unsplit.
+
+        Running a flush pass here is safe precisely because the caller has a
+        FINISHED segment: the VAD has already seen the trailing silence, so the
+        speech is complete and there is no live sentence to cut in half.
+
+        The poll afterwards is a fallback for the case where another pass held
+        the lock and covered the range concurrently.
         """
         if not self.enabled:
             return False
+        if self._covered_until >= until:
+            return True
+
         deadline = time.monotonic() + timeout
+        try:
+            # Not wrapped in wait_for: cancelling mid-pass would drop windows
+            # that `_pass` has already consumed from `_pending`, leaving a
+            # permanent hole in the timeline. Better to overshoot the timeout
+            # slightly than to lose coverage.
+            await self._pass(cover_until=until)
+        except DiarizationQueueFull as exc:
+            log.debug("coverage pass skipped: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("coverage pass failed: %s", exc)
+
         while self._covered_until < until:
             left = deadline - time.monotonic()
             if left <= 0:
                 return False
-            self._wake.set()
             try:
                 await asyncio.wait_for(self._coverage.wait(), timeout=min(left, 0.25))
             except asyncio.TimeoutError:
@@ -304,10 +360,27 @@ class DiarizationService:
             "covered_until": round(self._covered_until, 2),
         }
 
-    def reset(self) -> None:
+    def reset(self, at: Optional[float] = None) -> None:
+        """Forget every speaker identity, optionally WITHOUT resetting the clock.
+
+        `at` is the session-audio timestamp the next recording starts from, and
+        it exists because the WebSocket clock does not restart when the user
+        starts a new recording inside one session. Zeroing the offsets — which
+        is what a bare reset() does — would place the next windows at t=0 while
+        the transcript's chunks are still being stamped from `VADSegmenter.now`
+        at t=430. The timeline and the text would then be describing different
+        moments, and every label after the reset would be joined to the wrong
+        audio.
+
+        Called ONLY from the explicit new-recording control. Never on silence:
+        a six-second pause while an interviewee thinks is not a new recording,
+        and resetting there would fabricate a fresh set of identities in the
+        middle of a conversation.
+        """
         self.engine.reset()
         self.embedder.reset()
         self._pending.clear()
-        self._pending_offset = 0.0
-        self._fed_until = 0.0
-        self._covered_until = 0.0
+        t = 0.0 if at is None else float(at)
+        self._pending_offset = t
+        self._fed_until = t
+        self._covered_until = t

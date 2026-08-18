@@ -37,6 +37,7 @@ from typing import Any, Optional
 from fastapi import WebSocket
 
 from ..asr.scheduler import ASRScheduler
+from ..auth.context import TenantContext
 from .state import SessionState, new_session_id
 
 log = logging.getLogger("voxlive.sessions")
@@ -53,6 +54,10 @@ class SessionManager:
 
     def __init__(self) -> None:
         self._sessions: dict[str, SessionState] = {}
+        # organization_id -> {session_id}. Maintained alongside _sessions so
+        # a per-tenant count is O(1) on the admission path rather than a scan
+        # of every live session on the task.
+        self._by_org: dict[str, set[str]] = {}
         self._lock = asyncio.Lock()
 
     # --------------------------------------------------------------- create
@@ -60,10 +65,12 @@ class SessionManager:
     async def create(
         self,
         ws: WebSocket,
+        tenant: TenantContext,
         expected_speakers: int,
         asr_scheduler: ASRScheduler,
         postproc: Any,
         session_id: Optional[str] = None,
+        speaker_mode: str = "",
     ) -> SessionState:
         """Build and register a session. Does not start it — the caller does
         that, so a failure to register can never leave a running worker
@@ -72,18 +79,24 @@ class SessionManager:
         session = SessionState(
             ws=ws,
             session_id=sid,
+            tenant=tenant.with_session(sid),
             expected_speakers=expected_speakers,
             asr_scheduler=asr_scheduler,
             postproc=postproc,
+            speaker_mode=speaker_mode,
         )
         async with self._lock:
             self._sessions[sid] = session
+            self._by_org.setdefault(tenant.organization_id, set()).add(sid)
             total = len(self._sessions)
+            for_org = len(self._by_org[tenant.organization_id])
         log.info(
-            "session_started (expected_speakers=%s, active=%d)",
+            "session_started (speakers=%s/%s, active=%d, org_active=%d)",
             expected_speakers or "auto",
+            session.speaker_mode,
             total,
-            extra={"session_id": sid},
+            for_org,
+            extra={"session_id": sid, **tenant.log_fields()},
         )
         return session
 
@@ -98,8 +111,24 @@ class SessionManager:
         stale is fine, whereas contending with connect/disconnect is not."""
         return len(self._sessions)
 
+    def count_for_organization(self, organization_id: str) -> int:
+        """Live sessions for one tenant, on THIS task.
+
+        Lock-free like `count()`: it feeds the admission check, where being
+        one session stale is acceptable and contending with every connect and
+        disconnect is not. The race window admits at most a small overshoot,
+        which is the right trade against serialising admissions.
+        """
+        return len(self._by_org.get(organization_id, ()))
+
     def snapshot(self) -> list[dict]:
         return [s.snapshot() for s in list(self._sessions.values())]
+
+    def organization_breakdown(self) -> dict[str, int]:
+        """Live session count per organization — the per-tenant CloudWatch
+        dimension, and the first thing to look at when one customer is
+        consuming the task."""
+        return {org: len(ids) for org, ids in self._by_org.items() if ids}
 
     # --------------------------------------------------------------- remove
 
@@ -109,6 +138,14 @@ class SessionManager:
         `finally` block."""
         async with self._lock:
             session = self._sessions.pop(session_id, None)
+            if session is not None:
+                bucket = self._by_org.get(session.organization_id)
+                if bucket is not None:
+                    bucket.discard(session_id)
+                    if not bucket:
+                        # Drop empty buckets, or _by_org grows one permanent
+                        # entry per organization that ever connected.
+                        del self._by_org[session.organization_id]
             total = len(self._sessions)
         if session is not None:
             log.info(
@@ -116,7 +153,7 @@ class SessionManager:
                 session.snapshot()["age_sec"],
                 session.seg_id,
                 total,
-                extra={"session_id": session_id},
+                extra={"session_id": session_id, **session.tenant.log_fields()},
             )
         return session
 
@@ -132,6 +169,7 @@ class SessionManager:
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._by_org.clear()
         if not sessions:
             return
         log.info("shutting down %d active session(s)", len(sessions))

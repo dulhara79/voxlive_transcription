@@ -29,7 +29,7 @@
  *   <TranscriptView paragraphs={paragraphs} />
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { Fragment, useCallback, useMemo, useState } from "react";
 
 const LANG_LABEL = { si: "සිංහල", en: "English", ta: "தமிழ்" };
 
@@ -112,33 +112,51 @@ export default function TranscriptView({ paragraphs }) {
     <div className="space-y-3">
       {paragraphs.map((p, i) => {
         const c = speakerStyle(p.speaker);
+        const prev = i > 0 ? paragraphs[i - 1] : null;
+        // A RECORDING boundary. Speaker numbers reset when the user starts a
+        // new recording, so "Speaker 1" below the divider is a different human
+        // from "Speaker 1" above it. Without this line the transcript would
+        // show two people under one name with nothing to separate them.
+        const rec = p.recording ?? 1;
+        const isNewRecording = prev != null && (prev.recording ?? 1) !== rec;
         // Only re-announce the speaker when it actually changes: a wall of
         // repeated name badges makes a two-person conversation unreadable.
-        const isNewSpeaker = i === 0 || paragraphs[i - 1].speaker !== p.speaker;
+        const isNewSpeaker =
+          i === 0 || isNewRecording || prev.speaker !== p.speaker;
         return (
-          <div
-            key={p.paragraph_id}
-            className="rounded-lg border border-neutral-200 bg-white p-4 shadow-sm"
-            style={{ borderLeft: `3px solid ${c.bar}` }}
-          >
-            <div className="mb-2 flex items-center gap-2">
-              <span
-                className="rounded px-1.5 py-0.5 text-[11px] font-semibold"
-                style={{ background: c.bg, color: c.fg }}
-              >
-                {p.speaker}
-              </span>
-              {isNewSpeaker && (
-                <span className="text-[11px] text-neutral-400">
-                  {langLabel(p.language)}
+          <Fragment key={p.paragraph_id}>
+            {isNewRecording && (
+              <div className="flex items-center gap-3 pt-2" role="separator">
+                <span className="h-px flex-1 bg-neutral-200" />
+                <span className="text-[11px] font-medium uppercase tracking-wide text-neutral-400">
+                  Recording {rec} · speakers renumbered
                 </span>
-              )}
-              <span className="ml-auto text-[11px] tabular-nums text-neutral-400">
-                {fmtTime(p.start)} – {fmtTime(p.end)}
-              </span>
+                <span className="h-px flex-1 bg-neutral-200" />
+              </div>
+            )}
+            <div
+              className="rounded-lg border border-neutral-200 bg-white p-4 shadow-sm"
+              style={{ borderLeft: `3px solid ${c.bar}` }}
+            >
+              <div className="mb-2 flex items-center gap-2">
+                <span
+                  className="rounded px-1.5 py-0.5 text-[11px] font-semibold"
+                  style={{ background: c.bg, color: c.fg }}
+                >
+                  {p.speaker}
+                </span>
+                {isNewSpeaker && (
+                  <span className="text-[11px] text-neutral-400">
+                    {langLabel(p.language)}
+                  </span>
+                )}
+                <span className="ml-auto text-[11px] tabular-nums text-neutral-400">
+                  {fmtTime(p.start)} – {fmtTime(p.end)}
+                </span>
+              </div>
+              <p className="leading-relaxed text-neutral-900">{p.text}</p>
             </div>
-            <p className="leading-relaxed text-neutral-900">{p.text}</p>
-          </div>
+          </Fragment>
         );
       })}
     </div>

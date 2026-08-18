@@ -3,10 +3,21 @@ WebSocket message contract (server -> client).
 
 status:      {type:"status", state:"ready|transcribing|stopped"}
 transcript:  {type:"transcript", paragraph_id, segment_id, speaker, language,
-              text, start, end, final}
+              text, start, end, final, recording}
 refresh:     {type:"refresh", paragraphs:[<transcript messages>]}
 speakers:    {type:"speakers", count:int}
 error:       {type:"error", segment_id, message}
+
+RECORDING (new)
+  `recording` is a 1-based index of which recording inside this session the
+  paragraph belongs to. It only changes when the user presses NEW RECORDING,
+  never on silence.
+
+  It exists because speaker numbers are ONLY comparable within one recording.
+  The control resets the diarizer's identity registry, so "Speaker 1" in
+  recording 2 is a different human from "Speaker 1" in recording 1. A client
+  that ignores this field will show two different people under one name with
+  nothing to separate them, so render a divider when the value changes.
 
 PARAGRAPH IDENTITY (v10 — changed, read this)
   paragraph_id is the chunk_id of the paragraph's FIRST chunk. It is assigned

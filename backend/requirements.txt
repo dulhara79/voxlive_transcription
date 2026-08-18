@@ -47,14 +47,39 @@ python-dotenv>=1.0
 # ASR
 google-genai>=1.0
 
+# ---- authentication (app/auth, app/api/routes_auth.py) ----
+# PyJWT is pure Python and ~100 KB. Password hashing uses hashlib.scrypt from
+# the standard library on purpose: bcrypt and argon2-cffi both pull a compiled
+# extension, which means either a manylinux wheel or a C toolchain in the
+# image, for a primitive OpenSSL already provides.
+pyjwt>=2.8
+# EmailStr in the signup/login schemas needs this; pydantic does not bundle it.
+email-validator>=2.0
+
 # Diarization. NOTE: v10 dropped speaker-diarization-community-1, so the
 # pyannote.audio 4.x requirement is gone -- 3.1 is enough for the embedder.
+#
+# INSTALL TORCH FROM THE CPU INDEX BEFORE THIS FILE, ALWAYS:
+#
+#     pip install --index-url https://download.pytorch.org/whl/cpu \
+#         "torch>=2.2" "torchaudio>=2.2"
+#     pip install -r requirements.txt
+#
+# Plain `pip install torch` on Linux pulls the CUDA build -- nvidia-cudnn,
+# nvidia-cublas, nvidia-nccl and the rest, roughly 2 GB of GPU libraries that
+# cannot execute on a Fargate task because Fargate has no GPU. Installing the
+# CPU wheel first means the line below sees torch as already satisfied and
+# will not pull the CUDA build to satisfy pyannote's dependency. This is worth
+# ~2 GB of image on every deploy and every scale-out. See deploy/Dockerfile.
 pyannote.audio>=3.1
 torch>=2.2
 webrtcvad-wheels>=2.0.14
 
 numpy>=1.26
 scipy>=1.11
+
+cython
+nemo_toolkit[asr]
 
 # ---- optional: DIARIZATION_BACKEND=sortformer ----
 # Needs a GPU to be worth it. Install separately, not as part of the base set:

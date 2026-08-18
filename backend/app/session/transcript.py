@@ -48,6 +48,12 @@ class Chunk:
     text: str = ""
     language: str = ""
     speaker: Optional[int] = None  # 0-based; None = not diarized yet
+    # Which RECORDING inside this session the chunk belongs to. Bumped by the
+    # explicit new-recording control, never by silence. Speaker numbers are
+    # only comparable WITHIN one recording: "Speaker 1" in recording 2 is a
+    # different human from "Speaker 1" in recording 1, because the identity
+    # registry was reset between them.
+    recording: int = 1
 
 
 @dataclass
@@ -58,14 +64,22 @@ class TranscriptStore:
 
     # ----------------------------------------------------------------- chunks
 
-    def new_chunk(self, seg_id: int, start: float, end: float) -> Chunk:
+    def new_chunk(
+        self, seg_id: int, start: float, end: float, recording: int = 1
+    ) -> Chunk:
         """Reserve a chunk id BEFORE transcription.
 
         Reserving early is what makes the id stable: it reflects creation
         order, which is the audio clock, not ASR completion order, which is
         whatever Gemini's queue felt like.
         """
-        c = Chunk(chunk_id=self._next_id, seg_id=seg_id, start=start, end=end)
+        c = Chunk(
+            chunk_id=self._next_id,
+            seg_id=seg_id,
+            start=start,
+            end=end,
+            recording=recording,
+        )
         self._next_id += 1
         self.chunks.append(c)
         return c
@@ -79,17 +93,25 @@ class TranscriptStore:
 
     # ------------------------------------------------------------- relabeling
 
-    def relabel(self, lookup) -> bool:
+    def relabel(self, lookup, recording: Optional[int] = None) -> bool:
         """Re-derive every chunk's speaker from the diarization timeline.
 
         `lookup(start, end) -> speaker_id | None`. Returns True if anything
         moved. Called after every diarization pass, so the transcript converges
         on the timeline rather than being frozen at whatever was known when the
         text happened to arrive.
+
+        `recording` SCOPES the update. The diarizer only holds identities for
+        the recording currently in progress — the new-recording control clears
+        the rest — so relabelling everything would drag earlier recordings'
+        chunks against a timeline that no longer describes them. Passing the
+        current recording index leaves finished recordings alone, which is the
+        whole point of giving each one its own speaker universe.
         """
         changed = False
         last = None
-        for c in sorted(self.chunks, key=lambda x: (x.start, x.chunk_id)):
+        rows = [c for c in self.chunks if recording is None or c.recording == recording]
+        for c in sorted(rows, key=lambda x: (x.start, x.chunk_id)):
             s = lookup(c.start, c.end)
             if s is None:
                 # No timeline coverage (silence-only or not yet diarized).
@@ -102,6 +124,37 @@ class TranscriptStore:
                 last = s
         return changed
 
+    def unsplit_chunks(self, timeline) -> tuple[int, float]:
+        """Chunks the timeline says hold a speaker change. `(count, seconds)`.
+
+        A DIAGNOSTIC, not a repair. Chunk boundaries are decided once, before
+        ASR, from whatever the timeline knew then; `relabel()` can move a chunk
+        to a different speaker but cannot divide one. So if the final timeline
+        shows a turn change INSIDE a chunk, that chunk's text is a blend of two
+        people and will be shown under a single name no matter how good the
+        clustering gets.
+
+        The text cannot be split retroactively — Gemini returns a string with
+        no word timings, so there is nothing to cut it on. What this number is
+        for is telling you how much of the diarization error you are looking at
+        is clustering (fixable by tuning) versus segmentation (fixable only by
+        producing shorter chunks in the first place, via SILENCE_MS,
+        SOFT_MAX_SEGMENT_MS and MAX_SEGMENT_MS).
+        """
+        runs = [r for r in timeline if r[2] is not None]
+        if not runs:
+            return 0, 0.0
+        count = 0
+        seconds = 0.0
+        for c in self.chunks:
+            if not c.text:
+                continue
+            inside = {s for a, b, s in runs if b > c.start + 0.35 and a < c.end - 0.35}
+            if len(inside) > 1:
+                count += 1
+                seconds += c.end - c.start
+        return count, round(seconds, 1)
+
     # ------------------------------------------------------------- paragraphs
 
     def paragraphs(self) -> list[dict]:
@@ -111,7 +164,11 @@ class TranscriptStore:
             if not c.text:
                 continue
             spk = c.speaker if c.speaker is not None else 0
-            if out and out[-1]["_spk"] == spk:
+            # A recording boundary always breaks the paragraph, even when the
+            # speaker NUMBER matches: the numbers are not comparable across
+            # recordings, so merging them would silently glue two different
+            # people into one turn.
+            if out and out[-1]["_spk"] == spk and out[-1]["recording"] == c.recording:
                 p = out[-1]
                 p["text"] = f"{p['text']} {c.text}".strip()
                 p["end"] = round(c.end, 2)
@@ -130,6 +187,7 @@ class TranscriptStore:
                         "start": round(c.start, 2),
                         "end": round(c.end, 2),
                         "final": True,
+                        "recording": c.recording,
                         "_spk": spk,
                         "_langs": [c.language] if c.language else [],
                     }
@@ -141,7 +199,16 @@ class TranscriptStore:
             # A paragraph can legitimately be code-switched: Sinhala, then an
             # English clause, then back. Report the mix rather than pretending
             # the last chunk's language was the whole paragraph's.
-            p["language"] = langs[0] if len(langs) <= 1 else "+".join(langs)
+            #
+            # `langs` can be EMPTY: it is only appended to when a chunk carries
+            # a non-empty `language`, so a paragraph built entirely from chunks
+            # with a blank language left this list empty and `langs[0]` raised
+            # IndexError — taking down the whole transcript render, not just
+            # that paragraph. The normal ASR path always sets a language, which
+            # is why this has not fired in production; anything that sets text
+            # without one (a test, a future provider, a postprocess stage)
+            # would hit it.
+            p["language"] = langs[0] if len(langs) == 1 else "+".join(langs)
         return out
 
     def diff(self) -> tuple[list[dict], str]:

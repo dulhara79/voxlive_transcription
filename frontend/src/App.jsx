@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState, useEffect } from "react";
 import { useAudioStream } from "./hooks/useAudioStream";
 import { useTranscript } from "./components/TranscriptView.jsx";
 import TranscriptView from "./components/TranscriptView.jsx";
+import { useAuth } from "./auth/AuthContext.jsx";
 
 const WS_URL =
   (import.meta.env.VITE_WS_URL || "ws://localhost:8000") + "/ws/transcribe";
@@ -32,13 +33,24 @@ const SOURCES = [
   { id: "tab", label: "Tab audio" },
 ];
 
-// Auto is the DEFAULT: the diarizer estimates the speaker count from the audio,
-// so a user who doesn't know how many people are in a recording doesn't have to
-// guess. Setting a number is a CEILING that helps when the count is known —
-// never a requirement.
+// SPEAKER COUNT — semantics changed (supervisor review, Fix #1).
+//
+// It used to mean a CEILING: picking 2 told the backend "at most two", which
+// left it free to decide, several minutes into a two-person interview, that
+// the voices were similar enough to be one person — and then relabel the whole
+// transcript Speaker 1. For a recording where the user KNOWS there are two
+// people, that is the wrong contract.
+//
+//   Auto (0)  estimate the number of speakers
+//   2/3/4...  assume EXACTLY that many. The backend will not collapse them.
+//
+// Auto stays the default because the exact-count mode has a real cost, and it
+// is the mirror image of the bug it fixes: if you say 2 and only one person
+// speaks, that person WILL be split into two speakers. The selector says so.
 const SPEAKER_CHOICES = [0, 2, 3, 4, 5, 6];
 
 export default function App() {
+  const { user, signOut } = useAuth();
   const [source, setSource] = useState("mic");
   const [expectedSpeakers, setExpectedSpeakers] = useState(0);
   const [errors, setErrors] = useState([]);
@@ -67,15 +79,31 @@ export default function App() {
         handleMessage(data);
       } else if (data.type === "error") {
         setErrors((prev) => [...prev, { ...data, _error: true }]);
+      } else if (data.type === "rejected") {
+        // Admission control refused the session: the platform is at capacity,
+        // or this organization has used every concurrent session on its plan.
+        // Without this branch the frame is silently dropped and the user sees
+        // nothing at all, which is worse than any error message.
+        const retry = data.retry_after_sec
+          ? ` Try again in about ${data.retry_after_sec}s.`
+          : "";
+        const usage =
+          data.limit > 0 ? ` (${data.current}/${data.limit} in use)` : "";
+        setErrors((prev) => [
+          ...prev,
+          {
+            ...data,
+            _error: true,
+            message: (data.message || "Session refused.") + usage + retry,
+          },
+        ]);
       }
     },
     [handleMessage],
   );
 
-  const { start, stop, recording, status, level } = useAudioStream(
-    WS_URL,
-    onMessage,
-  );
+  const { start, stop, newRecording, recording, status, level } =
+    useAudioStream(WS_URL, onMessage);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -164,8 +192,19 @@ export default function App() {
     setErrors([]);
     setSavedSignature("");
     setConfirming(null);
-    start(source, expectedSpeakers);
+    // expectedSpeakers > 0 means the user asserted a count, so the backend runs
+    // in fixed mode and holds exactly that many identities. Auto (0) estimates.
+    start(source, expectedSpeakers, expectedSpeakers > 0 ? "fixed" : "auto");
   }, [reset, start, source, expectedSpeakers]);
+
+  // Explicit NEW RECORDING (supervisor review §10/§11). Deliberately a button
+  // and not a silence timer: only the user knows whether a gap was a pause or
+  // the end of a clip, and guessing wrong invents speakers mid-interview.
+  const onNewRecording = useCallback(() => {
+    if (!newRecording()) {
+      setErrors((e) => [...e, "Not connected — cannot start a new recording."]);
+    }
+  }, [newRecording]);
 
   const onPrimaryClick = useCallback(() => {
     if (recording) {
@@ -200,6 +239,7 @@ export default function App() {
         <div className="flex items-center gap-4">
           {recording && <LevelMeter level={level} />}
           <StatusPill status={status} recording={recording} />
+          <AccountMenu user={user} onSignOut={signOut} recording={recording} />
         </div>
       </header>
 
@@ -242,6 +282,23 @@ export default function App() {
               setSpeakers={setExpectedSpeakers}
               disabled={recording}
             />
+            {recording && (
+              <button
+                onClick={onNewRecording}
+                title={
+                  "Start a new recording without stopping the session.\n\n" +
+                  "Speaker identities start fresh from here, so the next clip's " +
+                  "Speaker 1 is a different person from this one's. The " +
+                  "transcript above is kept.\n\n" +
+                  "Use this between independent clips. A pause in a " +
+                  "conversation is NOT a new recording — don't press it when " +
+                  "someone is just thinking."
+                }
+                className="rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
+              >
+                New recording
+              </button>
+            )}
             <span className="hidden text-xs text-neutral-400 sm:block">
               {speakerCount} speaker{speakerCount !== 1 ? "s" : ""} ·{" "}
               {paragraphs.length} turn{paragraphs.length !== 1 ? "s" : ""} ·{" "}
@@ -360,7 +417,14 @@ function SpeakerSelect({ speakers, setSpeakers, disabled }) {
         "flex items-center gap-1.5 text-xs text-neutral-500 " +
         (disabled ? "opacity-50" : "")
       }
-      title="Auto estimates the speaker count from the audio. Choosing a number sets a CEILING, not a quota: set it to 2 and a monologue still stays one speaker."
+      title={
+        "Auto — estimate how many people are speaking.\n" +
+        "A number — assume EXACTLY that many speakers and never merge them.\n\n" +
+        "Pick a number when you know the count (a two-person interview): it stops " +
+        "two similar voices being collapsed into one speaker mid-recording.\n" +
+        "Pick Auto when you don't: assuming 2 while only one person speaks will " +
+        "split that person into two speakers."
+      }
     >
       <span className="hidden sm:inline">Speakers</span>
       <select
@@ -371,7 +435,7 @@ function SpeakerSelect({ speakers, setSpeakers, disabled }) {
       >
         {SPEAKER_CHOICES.map((n) => (
           <option key={n} value={n}>
-            {n === 0 ? "Auto" : n}
+            {n === 0 ? "Auto" : `Exactly ${n}`}
           </option>
         ))}
       </select>
@@ -490,4 +554,42 @@ function tsForFilename() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(
     d.getHours(),
   )}-${p(d.getMinutes())}`;
+}
+
+/**
+ * AccountMenu — which organization this transcript belongs to, and a way out.
+ *
+ * The organization name is shown rather than only the email because it is the
+ * thing that changes what the session does: quota, plan and every stored
+ * transcript are scoped to it, and a person with accounts at two customers
+ * otherwise has no way to tell which one they are recording into.
+ *
+ * Sign out is disabled while recording. It drops the token, which closes the
+ * socket mid-sentence and loses an undownloaded transcript.
+ */
+function AccountMenu({ user, onSignOut, recording }) {
+  if (!user) return null;
+  return (
+    <div className="flex items-center gap-3 border-l border-neutral-200 pl-4">
+      <div className="hidden text-right leading-tight sm:block">
+        <div className="text-xs font-medium text-neutral-700">
+          {user.organizationName}
+        </div>
+        <div className="text-[11px] text-neutral-400">{user.email}</div>
+      </div>
+      <button
+        type="button"
+        onClick={onSignOut}
+        disabled={recording}
+        title={
+          recording
+            ? "Stop the recording before signing out"
+            : "Sign out of VoxLive"
+        }
+        className="rounded-full border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        Sign out
+      </button>
+    </div>
+  );
 }

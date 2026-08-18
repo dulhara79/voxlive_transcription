@@ -71,6 +71,65 @@ WHAT WAS WRONG IN v10
 PUBLIC SURFACE is unchanged: add_windows / recluster / timeline / label_for /
 speaker_count / n_windows / reset, plus WIN_SEC, Window, speech_regions and
 slice_windows. `recluster()` gained an optional `force` argument.
+
+WHAT v12 CHANGES (supervisor review, P0)
+=======================================
+
+v11 could show Speaker 2 and then take it away again. The review traced the
+exact path, and it is not a threshold that needs nudging:
+
+    2 speakers detected
+           -> 4 s of new trusted audio arrives
+           -> the WHOLE session is reclustered from scratch
+           -> _choose_k vetoes K=2 because dmin < SAME_SPEAKER_MAX
+           -> best_k falls back to its initialiser, 1
+           -> every window in the session is reassigned to one centroid
+           -> Speaker 2 disappears and the history is relabelled
+
+Two independent things were wrong.
+
+1. EXPECTED_SPEAKERS WAS ONLY EVER A CEILING.
+   "2" meant "at most two", so K=1 stayed reachable for a recording the user
+   had already told us has two people in it. v12 splits that into an explicit
+   MODE:
+
+       speaker_mode="auto"   -> estimate K (expected_speakers is a ceiling,
+                                exactly as before — this is still the default,
+                                and every v11 behaviour is preserved)
+       speaker_mode="fixed"  -> K = expected_speakers, full stop. The
+                                separation veto and the relative-size prune
+                                are both bypassed, because both of them exist
+                                to REMOVE clusters and in fixed mode there is
+                                nothing to remove.
+
+   The review's caveat is real and is not papered over here: fixed K on a
+   recording where only one person actually speaks WILL split that person in
+   two. That is a UI contract ("assume exactly N"), not a bug, and the
+   frontend now says so.
+
+2. LIVE RECLUSTERING WAS FREE TO REWRITE HISTORY.
+   Even in auto mode, re-deciding K every four seconds means an established
+   identity can be deleted by a pass with a marginally better silhouette.
+   v12 introduces ESTABLISHMENT:
+
+       < ESTABLISH_SEC of trusted audio   provisional; K may still move
+       >= ESTABLISH_SEC                   identities are ESTABLISHED
+
+   Once established, a live pass no longer re-derives K. It does the
+   conservative thing instead: nudge each centroid toward its new membership
+   with an EMA (CENTROID_UPDATE_RATE), assign incoming windows to the nearest
+   existing identity, and — in auto mode only — admit a genuinely new voice
+   when NEW_IDENTITY_MIN_SEC of audio sits further than same_speaker_max from
+   EVERY known centroid AND agrees with itself.
+
+   Whole-session re-derivation still happens exactly once more, on
+   `recluster(force=True)`, which the service calls from `finalize()` when the
+   user actually stops. So:
+
+       LIVE  -> stable
+       FINAL -> refined
+
+   rather than v11's "LIVE -> constantly rewritten".
 """
 
 from __future__ import annotations
@@ -135,6 +194,31 @@ MIN_RUN_SEC = 0.80
 # New trusted audio required before clusters are re-derived from scratch.
 RECLUSTER_AFTER_SEC = 4.0
 
+# ---- v12: identity establishment -------------------------------------------
+# Trusted speech required before the speaker structure stops being provisional.
+# Below this the engine is still guessing from a couple of windows and must be
+# allowed to change its mind; above it, the structure is evidence-backed and a
+# live pass may no longer overturn it.
+#
+# In FIXED mode this is also the gate on forcing K. Forcing K=2 against three
+# seconds of one person talking would manufacture two identities out of one
+# voice and then lock them in for the session — the exact failure the review
+# warns about in its caveat. Waiting means the split is made against real
+# evidence.
+ESTABLISH_SEC = 8.0
+
+# How far a single live pass may move an established centroid. An identity is
+# an average over many seconds; one four-second pass is allowed to nudge it,
+# never to redefine it.
+CENTROID_UPDATE_RATE = 0.15
+
+# AUTO mode only. Trusted audio that must sit further than `same_speaker_max`
+# from EVERY known centroid — and agree with itself — before a new identity is
+# admitted after establishment. Deliberately larger than RECLUSTER_AFTER_SEC:
+# discovery should need more evidence than a routine pass carries.
+NEW_IDENTITY_MIN_SEC = 6.0
+NEW_IDENTITY_MIN_WINDOWS = 4
+
 
 def l2norm(v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=np.float64).ravel()
@@ -179,12 +263,14 @@ class SpeakerEngine:
         self,
         expected_speakers: int = 0,
         max_speakers: int = 6,
+        speaker_mode: str = "auto",
         same_speaker_max: float = SAME_SPEAKER_MAX,
         min_cluster_sec: float = 4.0,
         min_cluster_frac: float = 0.02,
         median_frames: int = 5,
         identity_match_max: float = IDENTITY_MATCH_MAX,
         recluster_after_sec: float = RECLUSTER_AFTER_SEC,
+        establish_sec: float = ESTABLISH_SEC,
         split_distance: float = 0.0,  # accepted for compatibility, unused
         **_ignored,
     ):
@@ -196,13 +282,38 @@ class SpeakerEngine:
         self.median_frames = int(median_frames) | 1
         self.identity_match_max = float(identity_match_max)
         self.recluster_after_sec = float(recluster_after_sec)
+        self.establish_sec = float(establish_sec)
 
-        # EXPECTED_SPEAKERS is a ceiling, not a quota: with cap=4 and one
-        # person talking, auto-K still returns 1.
+        # ---- v12: mode ----------------------------------------------------
+        # "auto"  -> estimate K; expected_speakers is a CEILING (v11 behaviour,
+        #            and still the default, so nothing that did not ask for
+        #            fixed K changes).
+        # "fixed" -> K IS expected_speakers. Requires a count to fix to; asking
+        #            for fixed mode without one is a configuration mistake, and
+        #            silently obeying it would give auto behaviour under a name
+        #            that promises otherwise.
+        mode = (speaker_mode or "auto").strip().lower()
+        if mode not in ("auto", "fixed"):
+            log.warning("unknown speaker_mode=%r — falling back to auto", speaker_mode)
+            mode = "auto"
+        if mode == "fixed" and self.expected_speakers <= 0:
+            log.warning(
+                "speaker_mode=fixed needs expected_speakers >= 1 "
+                "(got %d) — falling back to auto",
+                self.expected_speakers,
+            )
+            mode = "auto"
+        self.speaker_mode = mode
+
+        # In AUTO, EXPECTED_SPEAKERS is a ceiling, not a quota: with cap=4 and
+        # one person talking, auto-K still returns 1. In FIXED the cap and the
+        # target are the same number by definition.
         cap = self.expected_speakers or self.max_speakers
         self.cap = max(1, min(int(cap), HARD_MAX_SPEAKERS))
         if cap > HARD_MAX_SPEAKERS:
             log.warning("speaker ceiling %d clamped to %d", cap, HARD_MAX_SPEAKERS)
+        if self.speaker_mode == "fixed":
+            self.expected_speakers = self.cap
 
         self.windows: list[Window] = []
         self._identities: list[Identity] = []
@@ -211,6 +322,23 @@ class SpeakerEngine:
         self._timeline: list[tuple[float, float, int]] = []
         self._next_key = 0
         self._new_trusted_sec = 0.0
+
+        # v12: True once there is enough trusted audio for the speaker
+        # structure to count as evidence rather than a guess. After this, live
+        # passes adapt centroids but never re-decide K.
+        self._established = False
+
+        log.info(
+            "SpeakerEngine v12: mode=%s, %s, cap=%d, establish=%.1fs",
+            self.speaker_mode,
+            (
+                f"K={self.expected_speakers} (forced)"
+                if self.speaker_mode == "fixed"
+                else "K estimated"
+            ),
+            self.cap,
+            self.establish_sec,
+        )
 
     # --------------------------------------------------------------- ingest
 
@@ -227,26 +355,81 @@ class SpeakerEngine:
     # ------------------------------------------------------------ main pass
 
     def recluster(self, force: bool = False) -> bool:
-        """Re-derive speakers and the timeline. True if the timeline changed."""
+        """Re-derive speakers and the timeline. True if the timeline changed.
+
+        `force=True` is FINALISATION — the user stopped recording, every window
+        of the session exists, and a whole-session pass is now plain offline
+        diarization. That is the one place a full re-derivation is still
+        allowed to change the number of identities.
+
+        Everything else is LIVE, and the policy is the review's:
+
+            not established yet   provisional; keep re-deriving, K may move
+            established           never re-decide K; adapt centroids, assign
+                                  incoming windows to existing identities,
+                                  discover a new one only on strong evidence
+
+        v11 ran a full re-derivation every RECLUSTER_AFTER_SEC regardless, so
+        four seconds of audio could delete a speaker that ninety seconds of
+        audio had established. That is the collapse this method now prevents.
+        """
         trusted = [w for w in self.windows if w.trusted]
         if len(trusted) < 2:
             return False
 
-        need_full = (
-            force
-            or self._centroid_mat is None
-            or self._new_trusted_sec >= self.recluster_after_sec
-        )
-        if need_full:
-            if not self._derive_clusters(trusted):
+        if force:
+            before = len(self._identities)
+            if not self._derive_clusters(trusted, final=True):
                 return False
             self._new_trusted_sec = 0.0
+            after = len(self._identities)
+            if before and after != before:
+                # Worth a loud line: this is the one pass permitted to change
+                # the answer, so if the transcript renumbers at the very end,
+                # this log says why.
+                log.warning(
+                    "final pass revised the speaker count %d -> %d "
+                    "(whole-session re-clustering)",
+                    before,
+                    after,
+                )
+            self._established = True
+            return self._label_and_build()
 
+        if not self._established:
+            # Provisional phase. Behaves exactly like v11 — including K moving
+            # between passes — because with a few seconds of audio it SHOULD.
+            if self._centroid_mat is None or (
+                self._new_trusted_sec >= self.recluster_after_sec
+            ):
+                if not self._derive_clusters(trusted):
+                    return False
+                self._new_trusted_sec = 0.0
+                if self._trusted_sec(trusted) >= self.establish_sec:
+                    self._established = True
+                    log.info(
+                        "speaker identities ESTABLISHED after %.1fs of trusted "
+                        "audio: %d speaker(s), mode=%s. Live passes will now "
+                        "adapt centroids instead of re-deciding K.",
+                        self._trusted_sec(trusted),
+                        len(self._identities),
+                        self.speaker_mode,
+                    )
+            return self._label_and_build()
+
+        # Established. The expensive, destructive part is simply not run.
+        if self._new_trusted_sec >= self.recluster_after_sec:
+            self._new_trusted_sec = 0.0
+            self._adapt(trusted)
         return self._label_and_build()
+
+    @staticmethod
+    def _trusted_sec(trusted: list[Window]) -> float:
+        return float(sum(w.duration for w in trusted))
 
     # ---------------------------------------------------- cluster discovery
 
-    def _derive_clusters(self, trusted: list[Window]) -> bool:
+    def _derive_clusters(self, trusted: list[Window], final: bool = False) -> bool:
         X = np.stack([w.embedding for w in trusted])
         dur = np.array([w.duration for w in trusted], dtype=np.float64)
         starts = np.array([w.start for w in trusted], dtype=np.float64)
@@ -266,12 +449,25 @@ class SpeakerEngine:
 
         Dc = pdist(Xc, metric="cosine")
         Z = linkage(Dc, method="average")
-        k, sil, dmin = self._choose_k(Z, squareform(Dc), Xc, wc)
 
-        if k <= 1:
-            lab_c = np.zeros(len(Xc), dtype=int)
+        # v12: FIXED mode does not ask how many speakers there are. The user
+        # already answered that question, and `_choose_k`'s separation veto is
+        # exactly what turned that answer back into "maybe one".
+        forced = self._forced_k(self._trusted_sec(trusted), len(Xc), final=final)
+        if forced:
+            k = forced
+            lab_c = (
+                fcluster(Z, k, criterion="maxclust") - 1
+                if k > 1
+                else np.zeros(len(Xc), dtype=int)
+            )
+            sil, dmin = self._diagnostics(squareform(Dc), Xc, wc, lab_c, k)
         else:
-            lab_c = fcluster(Z, k, criterion="maxclust") - 1
+            k, sil, dmin = self._choose_k(Z, squareform(Dc), Xc, wc)
+            if k <= 1:
+                lab_c = np.zeros(len(Xc), dtype=int)
+            else:
+                lab_c = fcluster(Z, k, criterion="maxclust") - 1
         cents = self._centroids(Xc, wc, lab_c, max(1, k))
 
         # Refine on the FULL trusted set, twice, ignoring ambiguous and
@@ -288,8 +484,16 @@ class SpeakerEngine:
 
         lab, margin, best = self._nearest(X, cents)
         clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
-        cents, lab = self._prune(cents, lab, dur * clean, X)
-        cents, lab = self._enforce_cap(cents, lab, dur, X)
+        if forced:
+            # Both `_prune` and `_enforce_cap` exist to DELETE clusters, and a
+            # deletion here is precisely how a forced K=2 would decay back into
+            # K=1. A cluster that looks too small is not evidence that the
+            # second person is imaginary; it is evidence that they have not
+            # said much yet.
+            cents, lab = self._enforce_exact_k(cents, lab, dur, X, forced)
+        else:
+            cents, lab = self._prune(cents, lab, dur * clean, X)
+            cents, lab = self._enforce_cap(cents, lab, dur, X)
 
         spans = [
             (
@@ -302,14 +506,79 @@ class SpeakerEngine:
 
         log.info(
             "clusters: %d trusted window(s) (%d sampled) -> %d speaker(s) "
-            "(silhouette=%.3f, closest centroids=%.3f)",
+            "[%s] (silhouette=%.3f, closest centroids=%.3f)",
             len(trusted),
             len(Xs),
             len(cents),
+            f"K={forced} forced" if forced else "K estimated",
             sil,
             dmin,
         )
         return True
+
+    def _forced_k(self, trusted_sec: float, n_core: int, final: bool = False) -> int:
+        """The K that must be used, or 0 to let `_choose_k` decide.
+
+        FIXED mode holds back until `establish_sec` of trusted speech exists.
+        Splitting three seconds of one voice into two identities and then
+        locking them in is worse than a few seconds of provisional auto
+        behaviour — and the review's caveat about fixed K splitting a single
+        speaker is at its sharpest when there is barely any audio to judge on.
+        """
+        if self.speaker_mode != "fixed" or self.expected_speakers <= 0:
+            return 0
+        if not final and not self._established and trusted_sec < self.establish_sec:
+            return 0
+        # Never ask for more clusters than there are points to build them from.
+        return max(1, min(self.expected_speakers, n_core))
+
+    @staticmethod
+    def _diagnostics(
+        Dsq: np.ndarray, X: np.ndarray, w: np.ndarray, lab: np.ndarray, k: int
+    ) -> tuple[float, float]:
+        """Silhouette and closest-centroid distance for a K we did not choose.
+
+        Purely observational — nothing branches on these in fixed mode. They go
+        into the log line because `closest centroids=` is how you SEE that two
+        speakers in a recording sit at 0.43 and would have been vetoed at the
+        0.50 threshold in auto mode.
+        """
+        if k < 2 or len(np.unique(lab)) < 2:
+            return 0.0, 1.0
+        cents = SpeakerEngine._centroids(X, w, lab, k)
+        dmin = float(pdist(cents, metric="cosine").min())
+        return SpeakerEngine._silhouette(Dsq, lab, w, k), dmin
+
+    def _enforce_exact_k(
+        self,
+        cents: np.ndarray,
+        lab: np.ndarray,
+        dur: np.ndarray,
+        X: np.ndarray,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Leave the session with exactly `k` centroids — no more, no fewer.
+
+        Too many: keep the k that own the most speech and re-assign the rest.
+        Too few (a refinement pass emptied a cluster): re-seed the missing
+        centroid from the windows that fit the survivors WORST, which is the
+        best available guess at the person who has not been heard from much.
+        """
+        if len(cents) > k:
+            totals = np.array([dur[lab == c].sum() for c in range(len(cents))])
+            keep = sorted(np.argsort(-totals)[:k].tolist())
+            return self._remap(cents, keep, dur, X)
+
+        while len(cents) < k and len(X) > len(cents):
+            _, _, best = self._nearest(X, cents)
+            seed = int(np.argmax(best))
+            if best[seed] <= 1e-9:
+                break
+            cents = np.vstack([cents, l2norm(X[seed])])
+            log.debug("fixed K: re-seeded a missing centroid (d=%.3f)", best[seed])
+
+        lab, _, _ = self._nearest(X, cents)
+        return cents, lab
 
     def _sample(self, n: int) -> np.ndarray:
         """Uniform-over-time subsample. self.windows is already time-sorted, so
@@ -561,6 +830,125 @@ class SpeakerEngine:
         self._centroid_mat = cents
         self._display_of_cluster = np.array([i.display for i in fresh], dtype=int)
 
+    # --------------------------------------------------- live adaptation (v12)
+
+    def _adapt(self, trusted: list[Window]) -> None:
+        """The live pass, once identities are established.
+
+        This is the whole point of v12. It does the three things the review
+        asked for and nothing else:
+
+            1. re-estimate each established centroid CONSERVATIVELY (EMA), so a
+               person who moves closer to the microphone is tracked without one
+               pass being able to redefine who they are;
+            2. leave K alone — no `_choose_k`, no prune, no cap enforcement, so
+               there is no code path here that can delete Speaker 2;
+            3. in AUTO mode only, admit a new identity when the evidence is
+               strong (see `_discover`).
+
+        Note what is absent: no linkage, no silhouette, no K search. An
+        established session's live cost is now an argmin over centroids.
+        """
+        if self._centroid_mat is None:
+            return
+
+        cents = self._centroid_mat.copy()
+        X = np.stack([w.embedding for w in trusted])
+        dur = np.array([w.duration for w in trusted], dtype=np.float64)
+        starts = np.array([w.start for w in trusted], dtype=np.float64)
+
+        lab, margin, best = self._nearest(X, cents)
+        clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
+        if clean.sum() >= len(cents):
+            target = self._centroids(
+                X[clean], dur[clean], lab[clean], len(cents), fallback=cents
+            )
+            a = CENTROID_UPDATE_RATE
+            cents = np.stack(
+                [
+                    l2norm((1.0 - a) * cents[i] + a * target[i])
+                    for i in range(len(cents))
+                ]
+            )
+
+        fresh = self._discover(X, dur, cents)
+        if fresh is not None:
+            cents = np.vstack([cents, fresh])
+            log.info(
+                "new speaker identity discovered from %.1fs of audio unlike "
+                "any known voice -> %d speaker(s)",
+                NEW_IDENTITY_MIN_SEC,
+                len(cents),
+            )
+
+        lab, _, _ = self._nearest(X, cents)
+        spans = [
+            (
+                float(starts[lab == c].min()) if np.any(lab == c) else 0.0,
+                float(dur[lab == c].sum()),
+            )
+            for c in range(len(cents))
+        ]
+        # `_register` matches centroid-to-centroid, and the EMA guarantees each
+        # one barely moved, so every established identity re-matches itself and
+        # keeps its display number. That is what makes labels stable on screen.
+        self._register(cents, spans)
+
+    def _discover(
+        self, X: np.ndarray, dur: np.ndarray, cents: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """A genuinely new voice, or None.
+
+        The review's condition is "consistently far from ALL known speaker
+        centroids", and `consistently` is doing real work: a handful of windows
+        far from everyone is what a cough, a door, or a turn boundary looks
+        like. So a candidate must clear three bars, not one:
+
+            far        every window further than same_speaker_max from EVERY
+                       established centroid
+            enough     NEW_IDENTITY_MIN_SEC of it, over several windows
+            coherent   the far windows must sound like EACH OTHER, not merely
+                       unlike us — noise is unlike everything including itself
+
+        FIXED mode never discovers: the user stated the count.
+        """
+        if self.speaker_mode == "fixed":
+            return None
+        if len(cents) >= self.cap:
+            return None
+
+        best = cdist(X, cents, metric="cosine").min(axis=1)
+        far = best > self.same_speaker_max
+        if int(far.sum()) < NEW_IDENTITY_MIN_WINDOWS:
+            return None
+        if float(dur[far].sum()) < NEW_IDENTITY_MIN_SEC:
+            return None
+
+        Xf, wf = X[far], dur[far]
+        cand = l2norm((Xf * (wf / wf.sum())[:, None]).sum(axis=0))
+
+        # Coherence: keep only the far windows that agree with the candidate,
+        # then re-check that what remains is still substantial.
+        agree = (
+            cdist(Xf, cand[None, :], metric="cosine").ravel() <= self.same_speaker_max
+        )
+        if int(agree.sum()) < NEW_IDENTITY_MIN_WINDOWS:
+            return None
+        if float(wf[agree].sum()) < NEW_IDENTITY_MIN_SEC:
+            return None
+
+        Xa, wa = Xf[agree], wf[agree]
+        cand = l2norm((Xa * (wa / wa.sum())[:, None]).sum(axis=0))
+
+        # Final guard: the candidate must still be a different person from
+        # everyone already registered, measured centroid-to-centroid.
+        if (
+            float(cdist(cand[None, :], cents, metric="cosine").min())
+            < self.same_speaker_max
+        ):
+            return None
+        return cand
+
     # ------------------------------------------------- labelling & timeline
 
     def _label_and_build(self) -> bool:
@@ -733,7 +1121,18 @@ class SpeakerEngine:
             for i in sorted(self._identities, key=lambda x: x.display)
         ]
 
+    def established(self) -> bool:
+        """True once the speaker structure is evidence-backed rather than a
+        guess. Live passes stop re-deciding K at this point."""
+        return self._established
+
     def reset(self) -> None:
+        """Forget every speaker. Used by the explicit NEW RECORDING control.
+
+        Deliberately not called on silence: a six-second thinking pause in an
+        interview is not a new recording, and resetting there would invent a
+        fresh set of identities mid-conversation.
+        """
         self.windows.clear()
         self._identities.clear()
         self._centroid_mat = None
@@ -741,6 +1140,7 @@ class SpeakerEngine:
         self._timeline.clear()
         self._next_key = 0
         self._new_trusted_sec = 0.0
+        self._established = False
 
 
 # ---------------------------------------------------------------------------
