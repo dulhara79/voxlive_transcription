@@ -78,6 +78,9 @@ webrtcvad-wheels>=2.0.14
 numpy>=1.26
 scipy>=1.11
 
+cython
+nemo_toolkit[asr]
+
 # ---- optional: DIARIZATION_BACKEND=sortformer ----
 # Needs a GPU to be worth it. Install separately, not as part of the base set:
 #   pip install Cython packaging
