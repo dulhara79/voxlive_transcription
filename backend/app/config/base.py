@@ -68,7 +68,14 @@ class Settings:
     gemini_thinking_budget: int = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
 
     # ---- rolling ASR context ----
-    context_segments: int = int(os.getenv("CONTEXT_SEGMENTS", "4"))
+    # DEFAULT CHANGED 4 -> 0 (supervisor review, P1).
+    # Feeding the previous segments' text back to Gemini as context invites it
+    # to CONTINUE the previous sentence rather than transcribe only the new
+    # audio — the provider's own docstring says so. You cannot measure Sinhala
+    # WER/CER while handing the model old transcript text it may use as a
+    # prediction, so the clean baseline has to be the default and switching it
+    # on has to be the deliberate act.
+    context_segments: int = int(os.getenv("CONTEXT_SEGMENTS", "0"))
 
     # ---- language lock ----
     allowed_languages: tuple = _csv("ALLOWED_LANGUAGES", "si,en,ta")
@@ -103,6 +110,37 @@ class Settings:
     )
     expected_speakers: int = int(os.getenv("EXPECTED_SPEAKERS", "0"))
     max_speakers: int = int(os.getenv("MAX_SPEAKERS", "6"))
+    # SPEAKER_MODE=auto   EXPECTED_SPEAKERS is a CEILING; K is estimated.
+    # SPEAKER_MODE=fixed  K IS EXPECTED_SPEAKERS. Use this when you know the
+    #                     count (a two-person interview), because auto can and
+    #                     does collapse two similar voices into one. The cost
+    #                     is the mirror image: fixed K=2 will split a monologue
+    #                     into two speakers. The client sends `?speaker_mode=`
+    #                     per session; this is only the default.
+    speaker_mode: str = os.getenv("SPEAKER_MODE", "auto").strip().lower()
+    # Trusted speech required before the speaker structure stops being
+    # provisional. After this, live passes adapt centroids instead of
+    # re-deciding K, and in fixed mode K is forced from here on.
+    speaker_establish_sec: float = float(os.getenv("SPEAKER_ESTABLISH_SEC", "8.0"))
+
+    # ---- speech / music gate ----
+    # WebRTC VAD answers "does this look like speech?" and sung vocals pass
+    # that test comfortably; MIN_SEGMENT_RMS is an ENERGY gate and music is
+    # loud. Neither rejects a song, so today the only thing standing between a
+    # Sinhala song and a transcript of it is a sentence in the Gemini prompt.
+    #
+    #   off   no gate (v11 behaviour)
+    #   log   classify and LOG every segment, drop nothing  <-- default
+    #   drop  classify and discard segments judged to be music
+    #
+    # `log` is the default deliberately. The review is explicit that the
+    # classifier must be evaluated against YOUR recordings rather than assumed
+    # to work, so ship it observing first, read the logged scores on real
+    # Sinhala speech AND real songs, set MUSIC_GATE_THRESHOLD from what you
+    # see, and only then switch to `drop`. A gate that silently eats quiet
+    # Sinhala speech is worse than no gate at all.
+    music_gate_mode: str = os.getenv("MUSIC_GATE_MODE", "log").strip().lower()
+    music_gate_threshold: float = float(os.getenv("MUSIC_GATE_THRESHOLD", "0.60"))
     diarize_interval_sec: float = float(os.getenv("DIARIZE_INTERVAL_SEC", "1.5"))
     diarize_wait_ms: int = int(os.getenv("DIARIZE_WAIT_MS", "900"))
     # embedding | sortformer | auto  — see diarizer_factory.py
