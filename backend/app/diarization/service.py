@@ -69,6 +69,8 @@ class DiarizationService:
         sample_rate: int = 16000,
         expected_speakers: int = 0,
         max_speakers: int = 6,
+        speaker_mode: str = "auto",
+        establish_sec: float = 8.0,
         interval_sec: float = 1.5,
         vad_aggressiveness: int = 2,
         device: Optional[str] = None,
@@ -83,6 +85,8 @@ class DiarizationService:
         self.engine = SpeakerEngine(
             expected_speakers=expected_speakers,
             max_speakers=max_speakers,
+            speaker_mode=speaker_mode,
+            establish_sec=establish_sec,
             **engine_kw,
         )
         self.embedder = Embedder(hf_token, device=device, sample_rate=sample_rate)
@@ -356,10 +360,27 @@ class DiarizationService:
             "covered_until": round(self._covered_until, 2),
         }
 
-    def reset(self) -> None:
+    def reset(self, at: Optional[float] = None) -> None:
+        """Forget every speaker identity, optionally WITHOUT resetting the clock.
+
+        `at` is the session-audio timestamp the next recording starts from, and
+        it exists because the WebSocket clock does not restart when the user
+        starts a new recording inside one session. Zeroing the offsets — which
+        is what a bare reset() does — would place the next windows at t=0 while
+        the transcript's chunks are still being stamped from `VADSegmenter.now`
+        at t=430. The timeline and the text would then be describing different
+        moments, and every label after the reset would be joined to the wrong
+        audio.
+
+        Called ONLY from the explicit new-recording control. Never on silence:
+        a six-second pause while an interviewee thinks is not a new recording,
+        and resetting there would fabricate a fresh set of identities in the
+        middle of a conversation.
+        """
         self.engine.reset()
         self.embedder.reset()
         self._pending.clear()
-        self._pending_offset = 0.0
-        self._fed_until = 0.0
-        self._covered_until = 0.0
+        t = 0.0 if at is None else float(at)
+        self._pending_offset = t
+        self._fed_until = t
+        self._covered_until = t
