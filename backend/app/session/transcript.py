@@ -48,6 +48,12 @@ class Chunk:
     text: str = ""
     language: str = ""
     speaker: Optional[int] = None  # 0-based; None = not diarized yet
+    # Which RECORDING inside this session the chunk belongs to. Bumped by the
+    # explicit new-recording control, never by silence. Speaker numbers are
+    # only comparable WITHIN one recording: "Speaker 1" in recording 2 is a
+    # different human from "Speaker 1" in recording 1, because the identity
+    # registry was reset between them.
+    recording: int = 1
 
 
 @dataclass
@@ -58,14 +64,22 @@ class TranscriptStore:
 
     # ----------------------------------------------------------------- chunks
 
-    def new_chunk(self, seg_id: int, start: float, end: float) -> Chunk:
+    def new_chunk(
+        self, seg_id: int, start: float, end: float, recording: int = 1
+    ) -> Chunk:
         """Reserve a chunk id BEFORE transcription.
 
         Reserving early is what makes the id stable: it reflects creation
         order, which is the audio clock, not ASR completion order, which is
         whatever Gemini's queue felt like.
         """
-        c = Chunk(chunk_id=self._next_id, seg_id=seg_id, start=start, end=end)
+        c = Chunk(
+            chunk_id=self._next_id,
+            seg_id=seg_id,
+            start=start,
+            end=end,
+            recording=recording,
+        )
         self._next_id += 1
         self.chunks.append(c)
         return c
@@ -79,17 +93,25 @@ class TranscriptStore:
 
     # ------------------------------------------------------------- relabeling
 
-    def relabel(self, lookup) -> bool:
+    def relabel(self, lookup, recording: Optional[int] = None) -> bool:
         """Re-derive every chunk's speaker from the diarization timeline.
 
         `lookup(start, end) -> speaker_id | None`. Returns True if anything
         moved. Called after every diarization pass, so the transcript converges
         on the timeline rather than being frozen at whatever was known when the
         text happened to arrive.
+
+        `recording` SCOPES the update. The diarizer only holds identities for
+        the recording currently in progress — the new-recording control clears
+        the rest — so relabelling everything would drag earlier recordings'
+        chunks against a timeline that no longer describes them. Passing the
+        current recording index leaves finished recordings alone, which is the
+        whole point of giving each one its own speaker universe.
         """
         changed = False
         last = None
-        for c in sorted(self.chunks, key=lambda x: (x.start, x.chunk_id)):
+        rows = [c for c in self.chunks if recording is None or c.recording == recording]
+        for c in sorted(rows, key=lambda x: (x.start, x.chunk_id)):
             s = lookup(c.start, c.end)
             if s is None:
                 # No timeline coverage (silence-only or not yet diarized).
@@ -142,7 +164,11 @@ class TranscriptStore:
             if not c.text:
                 continue
             spk = c.speaker if c.speaker is not None else 0
-            if out and out[-1]["_spk"] == spk:
+            # A recording boundary always breaks the paragraph, even when the
+            # speaker NUMBER matches: the numbers are not comparable across
+            # recordings, so merging them would silently glue two different
+            # people into one turn.
+            if out and out[-1]["_spk"] == spk and out[-1]["recording"] == c.recording:
                 p = out[-1]
                 p["text"] = f"{p['text']} {c.text}".strip()
                 p["end"] = round(c.end, 2)
@@ -161,6 +187,7 @@ class TranscriptStore:
                         "start": round(c.start, 2),
                         "end": round(c.end, 2),
                         "final": True,
+                        "recording": c.recording,
                         "_spk": spk,
                         "_langs": [c.language] if c.language else [],
                     }
