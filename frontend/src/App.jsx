@@ -33,10 +33,20 @@ const SOURCES = [
   { id: "tab", label: "Tab audio" },
 ];
 
-// Auto is the DEFAULT: the diarizer estimates the speaker count from the audio,
-// so a user who doesn't know how many people are in a recording doesn't have to
-// guess. Setting a number is a CEILING that helps when the count is known —
-// never a requirement.
+// SPEAKER COUNT — semantics changed (supervisor review, Fix #1).
+//
+// It used to mean a CEILING: picking 2 told the backend "at most two", which
+// left it free to decide, several minutes into a two-person interview, that
+// the voices were similar enough to be one person — and then relabel the whole
+// transcript Speaker 1. For a recording where the user KNOWS there are two
+// people, that is the wrong contract.
+//
+//   Auto (0)  estimate the number of speakers
+//   2/3/4...  assume EXACTLY that many. The backend will not collapse them.
+//
+// Auto stays the default because the exact-count mode has a real cost, and it
+// is the mirror image of the bug it fixes: if you say 2 and only one person
+// speaks, that person WILL be split into two speakers. The selector says so.
 const SPEAKER_CHOICES = [0, 2, 3, 4, 5, 6];
 
 export default function App() {
@@ -92,10 +102,8 @@ export default function App() {
     [handleMessage],
   );
 
-  const { start, stop, recording, status, level } = useAudioStream(
-    WS_URL,
-    onMessage,
-  );
+  const { start, stop, newRecording, recording, status, level } =
+    useAudioStream(WS_URL, onMessage);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -184,8 +192,19 @@ export default function App() {
     setErrors([]);
     setSavedSignature("");
     setConfirming(null);
-    start(source, expectedSpeakers);
+    // expectedSpeakers > 0 means the user asserted a count, so the backend runs
+    // in fixed mode and holds exactly that many identities. Auto (0) estimates.
+    start(source, expectedSpeakers, expectedSpeakers > 0 ? "fixed" : "auto");
   }, [reset, start, source, expectedSpeakers]);
+
+  // Explicit NEW RECORDING (supervisor review §10/§11). Deliberately a button
+  // and not a silence timer: only the user knows whether a gap was a pause or
+  // the end of a clip, and guessing wrong invents speakers mid-interview.
+  const onNewRecording = useCallback(() => {
+    if (!newRecording()) {
+      setErrors((e) => [...e, "Not connected — cannot start a new recording."]);
+    }
+  }, [newRecording]);
 
   const onPrimaryClick = useCallback(() => {
     if (recording) {
@@ -263,6 +282,23 @@ export default function App() {
               setSpeakers={setExpectedSpeakers}
               disabled={recording}
             />
+            {recording && (
+              <button
+                onClick={onNewRecording}
+                title={
+                  "Start a new recording without stopping the session.\n\n" +
+                  "Speaker identities start fresh from here, so the next clip's " +
+                  "Speaker 1 is a different person from this one's. The " +
+                  "transcript above is kept.\n\n" +
+                  "Use this between independent clips. A pause in a " +
+                  "conversation is NOT a new recording — don't press it when " +
+                  "someone is just thinking."
+                }
+                className="rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs font-medium text-neutral-700 transition-colors hover:bg-neutral-100"
+              >
+                New recording
+              </button>
+            )}
             <span className="hidden text-xs text-neutral-400 sm:block">
               {speakerCount} speaker{speakerCount !== 1 ? "s" : ""} ·{" "}
               {paragraphs.length} turn{paragraphs.length !== 1 ? "s" : ""} ·{" "}
@@ -381,7 +417,14 @@ function SpeakerSelect({ speakers, setSpeakers, disabled }) {
         "flex items-center gap-1.5 text-xs text-neutral-500 " +
         (disabled ? "opacity-50" : "")
       }
-      title="Auto estimates the speaker count from the audio. Choosing a number sets a CEILING, not a quota: set it to 2 and a monologue still stays one speaker."
+      title={
+        "Auto — estimate how many people are speaking.\n" +
+        "A number — assume EXACTLY that many speakers and never merge them.\n\n" +
+        "Pick a number when you know the count (a two-person interview): it stops " +
+        "two similar voices being collapsed into one speaker mid-recording.\n" +
+        "Pick Auto when you don't: assuming 2 while only one person speaks will " +
+        "split that person into two speakers."
+      }
     >
       <span className="hidden sm:inline">Speakers</span>
       <select
@@ -392,7 +435,7 @@ function SpeakerSelect({ speakers, setSpeakers, disabled }) {
       >
         {SPEAKER_CHOICES.map((n) => (
           <option key={n} value={n}>
-            {n === 0 ? "Auto" : n}
+            {n === 0 ? "Auto" : `Exactly ${n}`}
           </option>
         ))}
       </select>
