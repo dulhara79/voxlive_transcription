@@ -436,10 +436,16 @@ class SortformerDiarizer:
             "covered_until": round(self._covered_until, 2),
         }
 
-    def reset(self) -> None:
+    def reset(self, at: Optional[float] = None) -> None:
+        """Forget every speaker identity, preserving the session clock.
+
+        Signature matches DiarizationService.reset so `SessionState` can call
+        the new-recording control without knowing which backend is loaded.
+        """
+        t = 0.0 if at is None else float(at)
         self._audio.clear()
-        self._audio_offset = 0.0
-        self._fed_until = 0.0
-        self._covered_until = 0.0
+        self._audio_offset = t
+        self._fed_until = t
+        self._covered_until = t
         self._timeline.clear()
         self._max_sid = -1
