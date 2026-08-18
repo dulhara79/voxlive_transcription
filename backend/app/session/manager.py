@@ -70,6 +70,7 @@ class SessionManager:
         asr_scheduler: ASRScheduler,
         postproc: Any,
         session_id: Optional[str] = None,
+        speaker_mode: str = "",
     ) -> SessionState:
         """Build and register a session. Does not start it — the caller does
         that, so a failure to register can never leave a running worker
@@ -82,6 +83,7 @@ class SessionManager:
             expected_speakers=expected_speakers,
             asr_scheduler=asr_scheduler,
             postproc=postproc,
+            speaker_mode=speaker_mode,
         )
         async with self._lock:
             self._sessions[sid] = session
@@ -89,8 +91,9 @@ class SessionManager:
             total = len(self._sessions)
             for_org = len(self._by_org[tenant.organization_id])
         log.info(
-            "session_started (expected_speakers=%s, active=%d, org_active=%d)",
+            "session_started (speakers=%s/%s, active=%d, org_active=%d)",
             expected_speakers or "auto",
+            session.speaker_mode,
             total,
             for_org,
             extra={"session_id": sid, **tenant.log_fields()},
