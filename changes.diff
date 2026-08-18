@@ -1,0 +1,734 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 793f727..de2f95f 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -118,11 +118,56 @@ DIARIZATION_MODE=on
+ #               into a multi-second one and looks like a hang, not a setting.
+ DIARIZATION_BACKEND=embedding
+ 
+-# Sortformer only: how much audio each pass re-diarizes. Identity across the
+-# seam is stitched by matching speakers on the overlap, so a speaker silent
+-# for LONGER than this window comes back with a new name. Larger = safer,
+-# and cost scales linearly (RTF ~0.002 on an RTX 6000).
+-SORTFORMER_WINDOW_SEC=20
++# Sortformer only: how much audio each LIVE pass re-diarizes. Identity across
++# the seam is stitched by matching speakers on the overlap, so a speaker silent
++# for LONGER than this window comes back with a new name. Larger = safer, and
++# cost scales linearly (RTF ~0.002 on an RTX 6000).
++#
++# THIS IS NOT THE QUALITY KNOB, and it was being treated as one. Back to the
++# documented default of 90. The supervisor review is explicit: this number
++# affects model context and seam count and NOTHING ELSE. It does not touch
++# cross-window identity matching, the 4-speaker cap, the cap fallback, short
++# turns, or overlapping speech — which is where the errors come from. Turning
++# 90 into 20 (or 20 into 60) is guessing.
++#
++# Before changing it:  python diag_diarization.py news.wav --truth news.txt
++# That tells you whether the model was wrong or the stitching was wrong. Tune
++# after you know, not before.
++SORTFORMER_WINDOW_SEC=90
++
++# ------------------------------------------------------------------
++# Sortformer FINAL pass (review point 11)
++# ------------------------------------------------------------------
++# After `stop` the whole recording is in hand, so the rolling window is no
++# longer a constraint worth respecting. `finalize()` used to just run the live
++# window one more time, inheriting every cross-window identity decision the
++# live path had already made.
++#
++#   offline  ONE inference over the whole recording with the non-streaming
++#            checkpoint; replaces the timeline outright.        <-- default
++#   rolling  the old behaviour. Also stops the session's audio being held.
++SORTFORMER_FINAL_PASS=offline
++
++# Blank uses nvidia/diar_sortformer_4spk-v1, the non-streaming checkpoint.
++# CHECK THE LICENCE BEFORE COMMERCIAL USE: that model is CC-BY-NC-4.0, unlike
++# the CC-BY-4.0 streaming model. This is an SLT decision, not a code one.
++SORTFORMER_OFFLINE_MODEL_ID=
++
++# Whole-file inference holds the entire recording on the GPU; the model card
++# puts the practical limit near 12 minutes on a 48 GB card. Past this the
++# offline pass is SKIPPED and the rolling timeline kept — a final pass over
++# "the last 12 minutes" would silently answer a different question.
++SORTFORMER_FINAL_MAX_SEC=720
++
++# ------------------------------------------------------------------
++# Diarization diagnostics (review point 17)
++# ------------------------------------------------------------------
++# Set a directory and each session writes, at `stop`:
++#   raw_sortformer.json     what the MODEL said, per pass, verbatim
++#   stitched_timeline.json  what the STITCHING did with it
++# Comparing the two is how you tell a model error from a stitching error.
++# Off by default: it holds every pass in memory for the life of the session.
++DIARIZE_DIAGNOSTICS_DIR=
+ 
+ # ============================================================
+ # SPEECH / MUSIC GATE  (supervisor review, Fix #4)
+diff --git a/backend/app/config/base.py b/backend/app/config/base.py
+index 6d75e08..e4ba186 100644
+--- a/backend/app/config/base.py
++++ b/backend/app/config/base.py
+@@ -145,7 +145,38 @@ class Settings:
+     diarize_wait_ms: int = int(os.getenv("DIARIZE_WAIT_MS", "900"))
+     # embedding | sortformer | auto  — see diarizer_factory.py
+     diarization_backend: str = os.getenv("DIARIZATION_BACKEND", "embedding")
++    # THIS IS NOT THE DIARIZATION QUALITY KNOB. It sets how much audio each
++    # LIVE Sortformer pass sees, which affects model context and the number of
++    # window seams — and nothing else. It does not touch cross-window identity
++    # matching, the 4-speaker cap, the cap fallback, short turns, or overlap,
++    # which is where the errors actually come from. Before changing it, run
++    # `python diag_diarization.py` to find out whether you are looking at a
++    # model error or a stitching error.
+     sortformer_window_sec: float = float(os.getenv("SORTFORMER_WINDOW_SEC", "90"))
++
++    # ---- Sortformer final pass ----
++    # offline  at `stop`, run ONE inference over the whole recording with the
++    #          non-streaming checkpoint and replace the timeline. No rolling
++    #          window, no stitching, no cap fallback.   <-- default
++    # rolling  repeat the live window at `stop` (the old behaviour). Also stops
++    #          the session's audio being held in memory.
++    sortformer_final_pass: str = os.getenv("SORTFORMER_FINAL_PASS", "offline").strip().lower()
++    # nvidia/diar_sortformer_4spk-v1 is the non-streaming checkpoint. Note it
++    # is CC-BY-NC-4.0, unlike the CC-BY-4.0 streaming model — check that
++    # against SLT's intended use before this goes anywhere commercial.
++    sortformer_offline_model_id: str = os.getenv("SORTFORMER_OFFLINE_MODEL_ID", "")
++    # Whole-file inference holds the entire recording on the GPU; the model
++    # card puts the practical limit near 12 minutes on a 48 GB card. Past this
++    # the offline pass is SKIPPED and the rolling timeline kept, rather than
++    # quietly diarizing only part of the session.
++    sortformer_final_max_sec: float = float(os.getenv("SORTFORMER_FINAL_MAX_SEC", "720"))
++
++    # Set to a directory to have each session write raw_sortformer.json and
++    # stitched_timeline.json at `stop`. Off by default: it holds every pass in
++    # memory for the life of the session. Turn it on when diarization is wrong
++    # and you need to know which stage was wrong.
++    diarize_diagnostics_dir: str = os.getenv("DIARIZE_DIAGNOSTICS_DIR", "")
++
+     huggingface_token: str = os.getenv("HUGGINGFACE_TOKEN", "")
+ 
+     # ---- optional pipeline stages ----
+diff --git a/backend/app/diarization/factory.py b/backend/app/diarization/factory.py
+index 2e9b9fe..0bd295c 100644
+--- a/backend/app/diarization/factory.py
++++ b/backend/app/diarization/factory.py
+@@ -96,6 +96,10 @@ def build_diarizer(settings, expected_speakers: int, speaker_mode: str = ""):
+             window_sec=float(getattr(settings, "sortformer_window_sec", 90.0)),
+             max_speakers=min(4, settings.max_speakers),
+             enabled=settings.diarization_enabled,
++            final_pass=getattr(settings, "sortformer_final_pass", "offline"),
++            final_max_sec=float(getattr(settings, "sortformer_final_max_sec", 720.0)),
++            offline_model_id=getattr(settings, "sortformer_offline_model_id", ""),
++            diagnostics_dir=getattr(settings, "diarize_diagnostics_dir", ""),
+         )
+ 
+     from .service import DiarizationService
+diff --git a/backend/app/diarization/sortformer.py b/backend/app/diarization/sortformer.py
+index f2974c4..53911ac 100644
+--- a/backend/app/diarization/sortformer.py
++++ b/backend/app/diarization/sortformer.py
+@@ -51,17 +51,49 @@ audio is arriving one chunk at a time. Here the window is already in hand, so
+ the "very high latency" row is strictly better: same accuracy, RTF 0.002
+ instead of 0.093. That is the difference between 0.18s and 8.4s per pass on a
+ 90-second window.
++
++LIVE AND FINAL ARE NOW DIFFERENT REGIMES
++----------------------------------------
++Everything above describes the LIVE path, and it is a compromise forced by not
++having heard the end of the sentence yet. After `stop` that constraint is gone:
++the whole recording is in hand, and re-running the rolling window one more time
++throws away the only advantage the final pass has.
++
++    LIVE     streaming checkpoint, rolling window, cross-window stitching
++    FINAL    offline checkpoint, ONE inference over the whole recording,
++             no window, no stitching, no cap fallback
++
++`finalize()` therefore runs a whole-session pass (see `offline.py`) and adopts
++its timeline wholesale, discarding the rolling numbering. That is deliberate:
++the offline result's speaker ids are internally consistent by construction, and
++reconciling them with the rolling ones would reintroduce exactly the error
++source the offline pass exists to remove.
++
++Set SORTFORMER_FINAL_PASS=rolling to get the old behaviour back — and to stop
++this class holding the session's audio, which is the price of the better pass.
++
++DO NOT TUNE SORTFORMER_WINDOW_SEC AND EXPECT THIS TO GET GOOD
++-------------------------------------------------------------
++The window length affects the amount of context the model sees and the number
++of seams. It does not touch cross-window identity matching, the speaker cap,
++short turns, or overlap. If the labelling is wrong, run
++`python diag_diarization.py` first: it separates what the MODEL got wrong from
++what the STITCHING got wrong, and until you know which of those you are looking
++at, changing this number is guessing.
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
++import json
+ import logging
+ import time
++from pathlib import Path
+ from typing import Awaitable, Callable, Optional
+ 
+ import numpy as np
+-from scipy.optimize import linear_sum_assignment
++
++from .stitching import LocalSpeakerTimeline, SortformerStitcher
+ 
+ log = logging.getLogger("voxlive.sortformer")
+ 
+@@ -133,6 +165,10 @@ class SortformerDiarizer:
+         device: Optional[str] = None,
+         enabled: bool = True,
+         max_speakers: int = 4,
++        final_pass: str = "offline",
++        final_max_sec: float = 720.0,
++        offline_model_id: str = "",
++        diagnostics_dir: str = "",
+         **_ignored,
+     ):
+         self.sample_rate = sample_rate
+@@ -144,14 +180,32 @@ class SortformerDiarizer:
+         self.enabled = bool(enabled)
+         self.max_speakers = min(4, int(max_speakers))
+ 
++        # "offline" runs one whole-session inference at stop; "rolling" repeats
++        # the live window, which is what this class used to do.
++        self.final_pass = (final_pass or "offline").strip().lower()
++        self.final_max_sec = float(final_max_sec)
++        self.offline_model_id = offline_model_id or ""
++
+         self._audio = bytearray()  # rolling window only
+         self._audio_offset = 0.0  # session seconds at _audio[0]
+         self._fed_until = 0.0
+         self._covered_until = 0.0
+ 
+-        # Session timeline, already stitched into a stable naming.
+-        self._timeline: list[tuple[float, float, int]] = []
+-        self._max_sid = -1
++        # The whole session, kept ONLY when the offline final pass needs it.
++        # 16 kHz mono PCM16 is ~1.9 MB/minute, so the ceiling is a real memory
++        # decision on a multi-tenant box, not a formality.
++        self._record_session = self.final_pass == "offline"
++        self._session_audio = bytearray()
++        self._session_truncated = False
++
++        # Stages 2-4 of the pipeline live in stitching.py; this class owns
++        # stage 1 (the model call) and hands the result over.
++        self._stitch = SortformerStitcher(self.max_speakers)
++        self._diagnostics_dir = Path(diagnostics_dir) if diagnostics_dir else None
++        self._stitch.keep_traces = self._diagnostics_dir is not None
++        self._final_pass_used = "none"
++        # The live timeline, preserved when the offline pass overwrites it.
++        self._rolling_timeline: list[tuple[float, float, int]] = []
+ 
+         self._model = None
+         self._task: Optional[asyncio.Task] = None
+@@ -172,6 +226,23 @@ class SortformerDiarizer:
+         self._audio.extend(pcm_bytes)
+         self._fed_until += len(pcm_bytes) / 2 / self.sample_rate
+ 
++        # Keep the whole session for the offline final pass. Past the ceiling
++        # we STOP recording rather than dropping the oldest audio: a final pass
++        # over "the last 12 minutes" silently answers a different question than
++        # a final pass over the recording, and a partial answer that looks
++        # complete is worse than an honest fallback to the rolling result.
++        if self._record_session and not self._session_truncated:
++            self._session_audio.extend(pcm_bytes)
++            if len(self._session_audio) > int(self.final_max_sec * self.sample_rate) * 2:
++                self._session_truncated = True
++                log.warning(
++                    "session exceeded SORTFORMER_FINAL_MAX_SEC=%.0fs; the offline "
++                    "final pass will be skipped and the rolling timeline kept. "
++                    "Raise the limit only if the GPU can hold the whole recording.",
++                    self.final_max_sec,
++                )
++                self._session_audio.clear()
++
+         # Trim to the rolling window. Identity across the seam is preserved by
+         # the stitching step, not by keeping the audio.
+         max_bytes = int(self.window_sec * self.sample_rate) * 2
+@@ -228,16 +299,21 @@ class SortformerDiarizer:
+             if segs is None:
+                 return
+ 
+-            window = [
+-                (a + offset, b + offset, s)
+-                for a, b, s in segs
+-                if b - a >= self.min_turn_sec and s < self.max_speakers
+-            ]
+-            window.sort()
+-            changed = self._stitch(window, offset)
++            # Stage 1 output becomes stage 2 input. The filtering that used to
++            # be inline here now lives with the timeline it produces, so the
++            # diagnostic can see what was dropped and why.
++            local = LocalSpeakerTimeline.from_inference(
++                segs,
++                offset=offset,
++                min_turn_sec=self.min_turn_sec,
++                max_speakers=self.max_speakers,
++            )
++            window = local.segments
++            changed = self._stitch.ingest(local)
+ 
+-            if self._timeline:
+-                self._covered_until = max(self._covered_until, self._timeline[-1][1])
++            end = self._stitch.timeline.end()
++            if end is not None:
++                self._covered_until = max(self._covered_until, end)
+             self._coverage.set()
+             self._coverage.clear()
+ 
+@@ -279,103 +355,177 @@ class SortformerDiarizer:
+             segs.append((a, b, idx))
+         return segs
+ 
+-    # ------------------------------------------------------------- stitching
++    # --------------------------------------------------------- final pass
+ 
+-    def _stitch(self, window: list, offset: float) -> bool:
+-        """Merge a window's local speaker slots into the session timeline.
+-
+-        Sortformer numbers speakers by arrival order *within the input it was
+-        given*. Across two overlapping windows those numberings agree only by
+-        luck, so slot 0 in this pass may be slot 1 in the session. Match them
+-        on the region the two share, by total overlapping speech, and carry the
+-        session's names forward.
+-        """
+-        prev = self._timeline
+-        if not prev:
+-            self._timeline = window
+-            self._max_sid = max((s for _, _, s in window), default=-1)
+-            return bool(window)
+-
+-        # The part of the session timeline this window also covers.
+-        overlap = [(a, b, s) for a, b, s in prev if b > offset]
+-        local_ids = sorted({s for _, _, s in window})
+-        sess_ids = sorted({s for _, _, s in overlap})
+-
+-        mapping: dict[int, int] = {}
+-        if overlap and local_ids and sess_ids:
+-            cost = np.zeros((len(local_ids), len(sess_ids)))
+-            for i, li in enumerate(local_ids):
+-                for j, sj in enumerate(sess_ids):
+-                    shared = 0.0
+-                    for a1, b1, s1 in window:
+-                        if s1 != li:
+-                            continue
+-                        for a2, b2, s2 in overlap:
+-                            if s2 != sj:
+-                                continue
+-                            ov = min(b1, b2) - max(a1, a2)
+-                            if ov > 0:
+-                                shared += ov
+-                    cost[i, j] = -shared
+-            rows, cols = linear_sum_assignment(cost)
+-            mapping = {
+-                local_ids[r]: sess_ids[c] for r, c in zip(rows, cols) if cost[r, c] < 0
+-            }
+-
+-        nxt = self._max_sid + 1
+-        for li in local_ids:
+-            if li in mapping:
+-                continue
+-            # A local slot with no overlap evidence is USUALLY a genuinely new
+-            # participant. But it can also be someone who simply said nothing
+-            # during the overlap region — Sortformer has no memory across two
+-            # separate `diarize()` calls, so there is no acoustic way to tell
+-            # from here. Minting freely would let one person collect several
+-            # ids over a long meeting, so the count is capped.
+-            if nxt >= self.max_speakers and self._timeline:
+-                mapping[li] = self._nearest_prior_speaker(window, li)
+-                log.debug(
+-                    "slot %d unmatched at the speaker cap; folded into %d",
+-                    li,
+-                    mapping[li],
+-                )
+-                continue
+-            mapping[li] = nxt
+-            nxt += 1
+-        self._max_sid = max(self._max_sid, nxt - 1)
+-
+-        merged = [(a, b, s) for a, b, s in prev if b <= offset]
+-        merged += [(a, b, mapping[s]) for a, b, s in window]
+-        merged.sort()
+-
+-        # Collapse runs the re-run split at a chunk edge.
+-        out: list[tuple[float, float, int]] = []
+-        for a, b, s in merged:
+-            if out and out[-1][2] == s and a - out[-1][1] < 0.12:
+-                out[-1] = (out[-1][0], max(out[-1][1], b), s)
+-            else:
+-                out.append((a, b, s))
+-
+-        changed = out != prev
+-        self._timeline = out
+-        return changed
+-
+-    def _nearest_prior_speaker(self, window: list, local_id: int) -> int:
+-        """Last resort at the speaker cap: whoever was talking most recently
+-        before this slot's first appearance. Conversation is sticky, so
+-        turn-taking adjacency is the only signal left once acoustic evidence
+-        has run out."""
+-        first = min((a for a, _, s in window if s == local_id), default=0.0)
+-        best, best_gap = 0, float("inf")
+-        for a, b, s in self._timeline:
+-            if b <= first and (first - b) < best_gap:
+-                best, best_gap = s, first - b
+-        return best
++    # NOTE: the cross-window stitching that used to live here — `_stitch()` and
++    # `_nearest_prior_speaker()` — is now `app/diarization/stitching.py`, split
++    # into LocalSpeakerTimeline / SpeakerAlignment / SessionIdentityManager /
++    # GlobalTimeline as the review asked. The algorithm is unchanged;
++    # `tests/test_stitching.py` holds the original and asserts they agree.
+ 
+     async def finalize(self) -> None:
++        """The best labelling this system can produce for a finished session.
++
++        Review point 11: the old implementation called `_pass()` again, which
++        re-ran the rolling window and inherited every cross-window identity
++        decision the live path had already made. The recording is complete by
++        now, so the window is no longer a constraint worth respecting.
++
++        The offline pass replaces the timeline outright. If it cannot run — no
++        offline checkpoint, no GPU, session too long, recording disabled — the
++        rolling result stands and the reason is logged. It is never silently
++        half-applied: a timeline that is partly offline and partly stitched is
++        a timeline nobody can reason about.
++        """
+         if not self.enabled:
+             return
+-        await self._pass()
++
++        if self.final_pass != "offline":
++            self._final_pass_used = "rolling"
++            await self._pass()
++            self._dump_diagnostics()
++            return
++
++        reason = self._offline_blocked_because()
++        if reason:
++            log.warning("offline final pass skipped (%s); keeping the rolling timeline", reason)
++            self._final_pass_used = f"rolling ({reason})"
++            await self._pass()
++            self._dump_diagnostics()
++            return
++
++        async with self._lock:
++            audio = bytes(self._session_audio)
++
++        duration = len(audio) / 2 / self.sample_rate
++        log.info("offline final pass over %.1fs of audio ...", duration)
++        t0 = time.perf_counter()
++        try:
++            from .offline import diarize_offline_sortformer
++
++            kwargs = {"sample_rate": self.sample_rate, "device": self.device}
++            if self.offline_model_id:
++                kwargs["model_id"] = self.offline_model_id
++            runs = await asyncio.to_thread(diarize_offline_sortformer, audio, **kwargs)
++        except Exception as exc:  # noqa: BLE001
++            log.warning(
++                "offline final pass failed (%s: %s); keeping the rolling timeline",
++                type(exc).__name__,
++                exc,
++            )
++            self._final_pass_used = "rolling (offline pass failed)"
++            await self._pass()
++            self._dump_diagnostics()
++            return
++
++        runs = [
++            (a, b, s)
++            for a, b, s in runs
++            if b - a >= self.min_turn_sec and s < self.max_speakers
++        ]
++
++        async with self._lock:
++            self._rolling_timeline = self._stitch.timeline.runs()
++            changed = self._stitch.adopt_offline(runs)
++            end = self._stitch.timeline.end()
++            if end is not None:
++                self._covered_until = max(self._covered_until, end)
++
++        self._final_pass_used = "offline"
++        log.info(
++            "offline final pass: %d run(s), %d speaker(s), %.1fs "
++            "(rolling had %d speaker(s))",
++            len(self._stitch.timeline),
++            self._stitch.timeline.speaker_count(),
++            time.perf_counter() - t0,
++            len({s for _, _, s in self._rolling_timeline}),
++        )
++        self._dump_diagnostics()
++
++        if changed and self.on_change:
++            await self.on_change()
++
++    def _offline_blocked_because(self) -> str:
++        if not self._record_session:
++            return "session recording disabled"
++        if self._session_truncated:
++            return f"session longer than SORTFORMER_FINAL_MAX_SEC={self.final_max_sec:.0f}s"
++        if len(self._session_audio) < self.sample_rate * 2:
++            return "less than 1s of audio"
++        return ""
++
++    def rolling_timeline(self) -> list[tuple[float, float, int]]:
++        """What the LIVE path produced, kept after the offline pass replaces it.
++
++        This is the input to `reconcile.py`: comparing the two is how you find
++        out whether the rolling window and its stitching were costing you
++        anything, and where.
++        """
++        return list(getattr(self, "_rolling_timeline", []))
++
++    # ------------------------------------------------------------ diagnostics
++
++    def _dump_diagnostics(self) -> None:
++        """Review point 17: write the debugging chain to disk.
++
++            raw_sortformer.json     what the MODEL said, per pass, verbatim
++            stitched_timeline.json  what the STITCHING did with it
++
++        Off unless DIARIZE_DIAGNOSTICS_DIR is set. Comparing these two files is
++        how you tell a model error from a stitching error without guessing.
++        """
++        if self._diagnostics_dir is None:
++            return
++        try:
++            self._diagnostics_dir.mkdir(parents=True, exist_ok=True)
++            traces = [t.to_dict() for t in self._stitch.traces]
++
++            (self._diagnostics_dir / "raw_sortformer.json").write_text(
++                json.dumps(
++                    {
++                        "model": MODEL_ID,
++                        "window_sec": self.window_sec,
++                        "interval_sec": self.interval,
++                        "min_turn_sec": self.min_turn_sec,
++                        "max_speakers": self.max_speakers,
++                        "passes": [
++                            {
++                                "pass": t["pass"],
++                                "offset_sec": t["offset_sec"],
++                                "raw_segments": t["raw_segments"],
++                                "window_segments": t["window_segments"],
++                            }
++                            for t in traces
++                        ],
++                    },
++                    indent=2,
++                ),
++                encoding="utf-8",
++            )
++
++            (self._diagnostics_dir / "stitched_timeline.json").write_text(
++                json.dumps(
++                    {
++                        "final_pass": self._final_pass_used,
++                        "cap_folds": self._stitch.fold_count(),
++                        "final_timeline": [
++                            [round(a, 3), round(b, 3), s]
++                            for a, b, s in self._stitch.timeline.runs()
++                        ],
++                        "rolling_timeline": [
++                            [round(a, 3), round(b, 3), s]
++                            for a, b, s in self.rolling_timeline()
++                        ],
++                        "passes": traces,
++                    },
++                    indent=2,
++                ),
++                encoding="utf-8",
++            )
++            log.info("diagnostics written to %s", self._diagnostics_dir)
++        except Exception as exc:  # noqa: BLE001
++            # A diagnostic that can take down a session is not a diagnostic.
++            log.warning("could not write diagnostics: %s", exc)
+ 
+     # ------------------------------------------------------------------ query
+ 
+@@ -398,7 +548,7 @@ class SortformerDiarizer:
+         if not self.enabled:
+             return 0
+         totals: dict[int, float] = {}
+-        for a, b, s in self._timeline:
++        for a, b, s in self._stitch.timeline.runs():
+             ov = min(end, b) - max(start, a)
+             if ov > 0:
+                 totals[s] = totals.get(s, 0.0) + ov
+@@ -407,7 +557,7 @@ class SortformerDiarizer:
+     def split_points(self, start: float, end: float) -> list[float]:
+         cuts: list[float] = []
+         prev = None
+-        for a, b, s in self._timeline:
++        for a, b, s in self._stitch.timeline.runs():
+             if b <= start or a >= end:
+                 continue
+             if prev is not None and s != prev and start + 0.35 < a < end - 0.35:
+@@ -416,10 +566,10 @@ class SortformerDiarizer:
+         return cuts
+ 
+     def timeline(self) -> list[tuple[float, float, int]]:
+-        return list(self._timeline)
++        return self._stitch.timeline.runs()
+ 
+     def speaker_count(self) -> int:
+-        return len({s for _, _, s in self._timeline})
++        return self._stitch.timeline.speaker_count()
+ 
+     # `main.py` reads diar.engine.speaker_count(); expose the same shape so the
+     # two backends stay interchangeable without a conditional at the call site.
+@@ -434,6 +584,11 @@ class SortformerDiarizer:
+             "speakers": self.speaker_count(),
+             "avg_infer_ms": round(self._infer_ms / max(1, self._passes), 1),
+             "covered_until": round(self._covered_until, 2),
++            "final_pass": self._final_pass_used,
++            # Every fold is a moment the cap fallback guessed an identity. A
++            # rising number here is the first thing to look at when speakers
++            # merge, and it only counts when diagnostics are on.
++            "cap_folds": self._stitch.fold_count(),
+         }
+ 
+     def reset(self, at: Optional[float] = None) -> None:
+@@ -447,5 +602,8 @@ class SortformerDiarizer:
+         self._audio_offset = t
+         self._fed_until = t
+         self._covered_until = t
+-        self._timeline.clear()
+-        self._max_sid = -1
++        self._stitch.reset()
++        self._session_audio.clear()
++        self._session_truncated = False
++        self._rolling_timeline = []
++        self._final_pass_used = "none"
+diff --git a/backend/tests/test_sortformer.py b/backend/tests/test_sortformer.py
+index bb8a7dd..d692f6f 100644
+--- a/backend/tests/test_sortformer.py
++++ b/backend/tests/test_sortformer.py
+@@ -5,26 +5,44 @@ the part that is easy to get wrong and would silently corrupt a long session:
+ Sortformer numbers speakers by arrival order *within the input it was given*,
+ so slot 0 in one window is not necessarily slot 0 in the next. If the stitch
+ gets that wrong, speakers swap names halfway through a meeting.
++
++The stitching itself now lives in `app/diarization/stitching.py` (review point
++15), so these tests drive it through `d._stitch.ingest(...)` rather than the
++old inline `d._stitch(window, offset)`. The ASSERTIONS are unchanged — the
++refactor was required not to alter behaviour, and this file is one of the
++places that holds it to that. `tests/test_stitching.py` checks the same thing
++against a copy of the original function.
+ """
+ 
+ import sys, os
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ 
+ from app.diarization.sortformer import SortformerDiarizer
++from app.diarization.stitching import LocalSpeakerTimeline
+ 
+ 
+-def make():
++def make(max_speakers: int = 4):
+     # enabled=True, but start() is never called — the background loop is opt-in,
+-    # and _stitch / label_for are pure and synchronous. (enabled=False would
+-    # short-circuit label_for to 0, which is the correct behaviour for
++    # and the stitcher / label_for are pure and synchronous. (enabled=False
++    # would short-circuit label_for to 0, which is the correct behaviour for
+     # DIARIZATION_MODE=off and the wrong thing to test against here.)
+-    return SortformerDiarizer(enabled=True, window_sec=90.0)
++    return SortformerDiarizer(
++        enabled=True, window_sec=90.0, max_speakers=max_speakers, final_pass="rolling"
++    )
++
++
++def stitch(d, window, offset):
++    """What `_pass()` does between the model call and the timeline: wrap the
++    window as a local timeline and hand it to the stitcher."""
++    return d._stitch.ingest(
++        LocalSpeakerTimeline(segments=list(window), offset=offset, raw=list(window))
++    )
+ 
+ 
+ def test_first_window_is_adopted_as_is():
+     d = make()
+     win = [(0.0, 10.0, 0), (12.0, 20.0, 1), (22.0, 30.0, 0)]
+-    assert d._stitch(win, offset=0.0)
++    assert stitch(d, win, 0.0)
+     assert d.timeline() == win
+     assert d.speaker_count() == 2
+     print("  first window adopted verbatim, 2 speakers  OK")
+@@ -39,17 +57,19 @@ def test_permuted_slots_across_windows_are_matched():
+     Without stitching, everyone's name flips at the 30 s mark.
+     """
+     d = make()
+-    d._stitch(
++    stitch(
++        d,
+         [(0.0, 20.0, 0), (25.0, 45.0, 1), (50.0, 70.0, 0), (75.0, 88.0, 1)],
+-        offset=0.0,
++        0.0,
+     )
+     before = {s for _, _, s in d.timeline() if _ < 20.0}
+ 
+     # Second window starts at 30 s; its slots are permuted relative to the
+     # session, and the overlap region (30-88 s) is what must resolve them.
+-    d._stitch(
++    stitch(
++        d,
+         [(30.0, 45.0, 0), (50.0, 70.0, 1), (75.0, 88.0, 0), (95.0, 115.0, 1)],
+-        offset=30.0,
++        30.0,
+     )
+     tl = d.timeline()
+     by_time = {round(a, 1): s for a, b, s in tl}
+@@ -68,11 +88,12 @@ def test_new_speaker_mid_session_gets_a_new_id():
+     """Realistic geometry: the window is 90 s and slides ~2 s per pass, so the
+     overlap is nearly the whole window and every active speaker appears in it."""
+     d = make()
+-    d._stitch([(0.0, 20.0, 0), (25.0, 45.0, 1), (50.0, 70.0, 0)], offset=0.0)
++    stitch(d, [(0.0, 20.0, 0), (25.0, 45.0, 1), (50.0, 70.0, 0)], 0.0)
+     # Next pass: same audio plus a third person joining at 75 s.
+-    d._stitch(
++    stitch(
++        d,
+         [(0.0, 20.0, 0), (25.0, 45.0, 1), (50.0, 70.0, 0), (75.0, 88.0, 2)],
+-        offset=0.0,
++        0.0,
+     )
+     assert d.speaker_count() == 3, d.timeline()
+     assert sorted({s for _, _, s in d.timeline()}) == [0, 1, 2]
+@@ -93,10 +114,9 @@ def test_speaker_cap_prevents_id_inflation():
+     and still be recognised. That is a real reason to prefer it for long,
+     uneven sessions.
+     """
+-    d = make()
+-    d.max_speakers = 2
+-    d._stitch([(0.0, 20.0, 0), (25.0, 45.0, 1)], offset=0.0)
+-    d._stitch([(25.0, 45.0, 0), (50.0, 60.0, 1)], offset=25.0)
++    d = make(max_speakers=2)
++    stitch(d, [(0.0, 20.0, 0), (25.0, 45.0, 1)], 0.0)
++    stitch(d, [(25.0, 45.0, 0), (50.0, 60.0, 1)], 25.0)
+     assert d.speaker_count() <= 2, d.timeline()
+     print(f"  at the cap, unmatched slots fold instead of inflating "
+           f"({d.speaker_count()} ids)  OK")
+@@ -104,9 +124,9 @@ def test_speaker_cap_prevents_id_inflation():
+ 
+ def test_adjacent_runs_merge_across_a_chunk_edge():
+     d = make()
+-    d._stitch([(0.0, 10.0, 0)], offset=0.0)
++    stitch(d, [(0.0, 10.0, 0)], 0.0)
+     # The re-run split one continuous turn at a chunk boundary.
+-    d._stitch([(0.0, 10.0, 0), (10.05, 18.0, 0)], offset=0.0)
++    stitch(d, [(0.0, 10.0, 0), (10.05, 18.0, 0)], 0.0)
+     tl = d.timeline()
+     assert len(tl) == 1, tl
+     assert tl[0] == (0.0, 18.0, 0), tl
+@@ -115,7 +135,7 @@ def test_adjacent_runs_merge_across_a_chunk_edge():
+ 
+ def test_label_and_split_lookups():
+     d = make()
+-    d._stitch([(0.0, 10.0, 0), (10.5, 20.0, 1), (20.5, 30.0, 0)], offset=0.0)
++    stitch(d, [(0.0, 10.0, 0), (10.5, 20.0, 1), (20.5, 30.0, 0)], 0.0)
+     assert d.label_for(2.0, 5.0) == 0
+     assert d.label_for(12.0, 18.0) == 1
+     # A segment straddling a turn change reports the majority speaker...
