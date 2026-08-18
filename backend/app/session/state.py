@@ -54,6 +54,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from ..api.schemas import error_msg, refresh_msg, speakers_msg, status_msg
 from ..auth.context import TenantContext
 from ..asr.scheduler import ASRQueueFull, ASRScheduler
+from ..audio.music_gate import is_music
 from ..audio.vad import Segment, VADSegmenter
 from ..config import settings
 from ..diarization.factory import build_diarizer
@@ -121,6 +122,7 @@ class SessionState:
         expected_speakers: int,
         asr_scheduler: ASRScheduler,
         postproc: Any,
+        speaker_mode: str = "",
     ):
         # ---- identity -----------------------------------------------------
         self.session_id = session_id
@@ -130,6 +132,11 @@ class SessionState:
         self.organization_id = tenant.organization_id
         self.user_id = tenant.user_id
         self.expected_speakers = expected_speakers
+        # "auto" = estimate K (expected_speakers is a ceiling).
+        # "fixed" = K IS expected_speakers. Chosen per session by the client.
+        self.speaker_mode = (
+            speaker_mode or getattr(settings, "speaker_mode", "auto") or "auto"
+        ).lower()
         self.created_at = time.time()
         self.last_activity = self.created_at
         self.status = SessionStatus.CONNECTING
@@ -148,8 +155,22 @@ class SessionState:
             min_segment_ms=settings.min_segment_ms,
         )
         self.store = TranscriptStore()
-        self.diar = build_diarizer(settings, expected_speakers)
+        self.diar = build_diarizer(settings, expected_speakers, self.speaker_mode)
         self.diar.on_change = self.on_diarization_change
+
+        # ---- recording segmentation (supervisor review, §10/§11) ----------
+        # A session may contain SEVERAL independent recordings. The review is
+        # explicit that "pause in conversation" and "new recording" are
+        # different events and that speakers must NOT be reset on silence — a
+        # six-second thinking pause in an interview is not a new recording, and
+        # resetting there would invent fresh identities mid-conversation.
+        #
+        # So the reset is an explicit client control, and this counter marks
+        # which recording each chunk belongs to. Without it, two different
+        # people in two different recordings would both render as "Speaker 1"
+        # in one transcript with nothing to distinguish them.
+        self.recording = 1
+        self.recording_started_at = 0.0
 
         self.recent: Optional[deque] = (
             deque(maxlen=settings.context_segments)
@@ -266,7 +287,10 @@ class SessionState:
     async def on_diarization_change(self) -> None:
         """A diarization pass moved the timeline: re-derive every label."""
         async with self.emit_lock:
-            if self.store.relabel(self.diar.label_for):
+            # Scoped to the CURRENT recording: the diarizer's timeline only
+            # covers this one, and earlier recordings keep the labels they
+            # finished with.
+            if self.store.relabel(self.diar.label_for, recording=self.recording):
                 await self.publish()
 
     # -------------------------------------------------------------- inbound
@@ -373,7 +397,7 @@ class SessionState:
         try:
             await self.diar.finalize()
             async with self.emit_lock:
-                if self.store.relabel(self.diar.label_for):
+                if self.store.relabel(self.diar.label_for, recording=self.recording):
                     log.info(
                         "final pass corrected the transcript",
                         extra={"session_id": self.session_id},
@@ -411,6 +435,73 @@ class SessionState:
         # Baseline parity: after `stop` the socket stays open and the client may
         # start a new recording on the same connection.
         self.status = SessionStatus.ACTIVE
+
+    async def new_recording(self) -> None:
+        """Client pressed NEW RECORDING (supervisor review, §10).
+
+        Starts an independent speaker universe on the SAME WebSocket session,
+        without touching the transcript already on screen and without stopping
+        the session clock.
+
+        WHY THIS IS AN EXPLICIT CONTROL AND NOT A SILENCE TIMER
+        ------------------------------------------------------
+        The review is direct about this: do NOT reset on silence. Consider
+
+            Interviewer: "Can you explain that?"
+            [6 second thinking pause]
+            Interviewee: "Yes..."
+
+        A silence-triggered reset there would fabricate a whole new set of
+        identities in the middle of one conversation. The application has to
+        distinguish "pause" from "new recording", and only the user knows
+        which one just happened — so only the user gets to say.
+
+        WHAT IS AND IS NOT RESET
+          reset:      speaker identities, centroids, windows, timeline
+          preserved:  the transcript, the audio clock, the session, the socket
+
+        The clock matters. `DiarizationService.reset()` used to zero its
+        offsets, which would place the next windows at t=0 while
+        `VADSegmenter.now` keeps stamping chunks at t=430 — timeline and text
+        describing different moments. It now takes the current audio time so
+        the two stay on one clock.
+        """
+        async with self.emit_lock:
+            # Drain what the old identities still owe the transcript first, so
+            # the previous recording keeps its best labelling rather than being
+            # frozen mid-correction.
+            try:
+                await self.diar.finalize()
+                self.store.relabel(self.diar.label_for, recording=self.recording)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "final pass before new recording failed: %s",
+                    exc,
+                    extra={"session_id": self.session_id},
+                )
+
+            at = self.seg.now
+            self.diar.reset(at)
+            self.recording += 1
+            self.recording_started_at = at
+            # Rolling ASR context must not leak across the boundary either: the
+            # previous recording's last sentence is not context for this one.
+            if self.recent is not None:
+                self.recent.clear()
+
+            log.info(
+                "new recording %d started at %.1fs — speaker identities reset",
+                self.recording,
+                at,
+                extra={
+                    "session_id": self.session_id,
+                    "event": "new_recording",
+                    "recording": self.recording,
+                },
+            )
+            self.last_speaker_count = 0
+            await self.send(refresh_msg(self.store.paragraphs()))
+        await self.send(status_msg("ready"))
 
     # --------------------------------------------------------------- worker
 
@@ -475,6 +566,44 @@ class SessionState:
             )
             return
 
+        # ---- speech / music gate (supervisor review, Fix #4) -------------
+        # The RMS check above is an ENERGY gate and music is loud, so it never
+        # rejected a song. WebRTC VAD is a SPEECH detector and sung vocals pass
+        # it. Until now the only thing between a Sinhala song and a transcript
+        # of it was a line in the Gemini prompt asking a generative model to
+        # also be an audio classifier.
+        #
+        # Runs BEFORE the ASR call but AFTER the diarizer has already been fed
+        # (that happens continuously in feed_audio), so a rejected segment
+        # costs a Gemini request and nothing else — the speaker timeline keeps
+        # its uninterrupted clock either way.
+        if settings.music_gate_mode in ("log", "drop"):
+            discard, verdict = is_music(
+                segment.pcm, settings.sample_rate, settings.music_gate_threshold
+            )
+            if settings.music_gate_mode == "log":
+                # Observation only. Read these lines on real Sinhala speech and
+                # real songs, then set MUSIC_GATE_THRESHOLD from the actual
+                # distribution before switching the mode to `drop`.
+                log.info(
+                    "music-gate: segment %d %s (mode=log, nothing dropped)",
+                    seg_id,
+                    verdict.as_log(),
+                    extra={"session_id": self.session_id, "segment_id": seg_id},
+                )
+            elif discard:
+                log.info(
+                    "segment %d discarded as music: %s",
+                    seg_id,
+                    verdict.as_log(),
+                    extra={
+                        "session_id": self.session_id,
+                        "segment_id": seg_id,
+                        "event": "music_rejected",
+                    },
+                )
+                return
+
         log.info(
             "segment %d: %.2f-%.2fs (%.2fs, %s) rms=%.0f",
             seg_id,
@@ -497,7 +626,10 @@ class SessionState:
         pieces = self._split(segment)
 
         async with self.emit_lock:
-            chunks = [(self.store.new_chunk(seg_id, a, b), pcm) for pcm, a, b in pieces]
+            chunks = [
+                (self.store.new_chunk(seg_id, a, b, self.recording), pcm)
+                for pcm, a, b in pieces
+            ]
 
         await self.send(status_msg("transcribing"))
         context = " ".join(self.recent) if self.recent else None
