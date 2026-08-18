@@ -76,9 +76,10 @@ WS_TRY_AGAIN_LATER = 1013
 def _expected_speakers(ws: WebSocket) -> int:
     """`?speakers=N` from the client, if it is a sane integer.
 
-    Treated as a CEILING by the speaker engine, not a quota — a bad value is
-    ignored rather than rejected, because a malformed query parameter is not
-    a reason to refuse someone's recording.
+    What N MEANS is decided by `?speaker_mode=` below, not here: a ceiling in
+    auto mode, an exact count in fixed mode. A bad value is ignored rather than
+    rejected, because a malformed query parameter is not a reason to refuse
+    someone's recording.
     """
     raw = ws.query_params.get("speakers")
     if not raw:
@@ -88,6 +89,30 @@ def _expected_speakers(ws: WebSocket) -> int:
     except ValueError:
         log.warning("ignoring non-integer ?speakers=%r", raw)
         return settings.expected_speakers
+
+
+def _speaker_mode(ws: WebSocket) -> str:
+    """`?speaker_mode=auto|fixed`, defaulting to SPEAKER_MODE from .env.
+
+    auto   estimate the speaker count; `?speakers=N` is a CEILING.
+    fixed  the speaker count IS `?speakers=N`. For a recording where the user
+           knows the count — a two-person interview — this is what stops the
+           clustering stage from deciding, several minutes in, that the two
+           voices were similar enough to be one person and relabelling the
+           whole transcript.
+
+    `fixed` without a positive `?speakers=` has nothing to fix K to. The engine
+    falls back to auto and says so in its own log; the request is not refused,
+    because dropping a session over a query-string mistake is worse than
+    running it with the safer of the two behaviours.
+    """
+    raw = (ws.query_params.get("speaker_mode") or "").strip().lower()
+    if not raw:
+        return settings.speaker_mode
+    if raw not in ("auto", "fixed"):
+        log.warning("ignoring unknown ?speaker_mode=%r", raw)
+        return settings.speaker_mode
+    return raw
 
 
 async def _authenticate(ws: WebSocket) -> Optional[TenantContext]:
@@ -153,6 +178,7 @@ async def transcribe(ws: WebSocket) -> None:
         ws=ws,
         tenant=tenant,
         expected_speakers=_expected_speakers(ws),
+        speaker_mode=_speaker_mode(ws),
         asr_scheduler=ws.app.state.asr_scheduler,
         postproc=ws.app.state.postproc,
     )
@@ -187,6 +213,18 @@ async def transcribe(ws: WebSocket) -> None:
 
                     elif msg.get("text") == "stop":
                         await session.finish()
+
+                    elif msg.get("text") == "new_recording":
+                        # Explicit NEW RECORDING control (supervisor review
+                        # §10/§11). Independent speaker identities from here
+                        # on, transcript and socket preserved.
+                        #
+                        # This is a control the USER presses. There is
+                        # deliberately no silence-triggered equivalent: a long
+                        # pause in a conversation is not a new recording, and
+                        # resetting identities there would invent new speakers
+                        # mid-interview.
+                        await session.new_recording()
 
             except WebSocketDisconnect:
                 log.info(
