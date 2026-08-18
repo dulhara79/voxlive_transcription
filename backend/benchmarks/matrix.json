@@ -1,0 +1,98 @@
+{
+  "_readme": [
+    "The diarization scenario matrix. Each row is a claim the system should be",
+    "able to survive; a row with no wav on disk is a claim you have not tested.",
+    "",
+    "wav    mono 16 kHz PCM:  ffmpeg -i in.mp4 -ac 1 -ar 16000 -c:a pcm_s16le out.wav",
+    "truth  Audacity labels (Ctrl+B at each speaker change, then Export Labels)",
+    "       or RTTM. See eval_diarization.py for the format.",
+    "",
+    "speaker_mode defaults to 'auto' and should STAY auto for almost every row:",
+    "the matrix is testing whether K can be discovered, and telling the engine",
+    "the answer measures nothing. 'interview_fixed' is the one row that exists",
+    "to exercise fixed mode.",
+    "",
+    "Paths are relative to this file."
+  ],
+  "scenarios": [
+    {
+      "id": "interview",
+      "wav": "audio/interview.wav",
+      "truth": "audio/interview.txt",
+      "true_speakers": 2,
+      "purpose": "baseline — the case that already works"
+    },
+    {
+      "id": "interview_fixed",
+      "wav": "audio/interview.wav",
+      "truth": "audio/interview.txt",
+      "true_speakers": 2,
+      "speaker_mode": "fixed",
+      "speakers_hint": 2,
+      "purpose": "fixed mode still holds two identities for a whole session"
+    },
+    {
+      "id": "podcast",
+      "wav": "audio/podcast.wav",
+      "truth": "audio/podcast.txt",
+      "true_speakers": 3,
+      "purpose": "multi-speaker — first row the 2-speaker default cannot pass"
+    },
+    {
+      "id": "panel",
+      "wav": "audio/panel.wav",
+      "truth": "audio/panel.txt",
+      "true_speakers": 4,
+      "purpose": "speaker discovery past the usual ceiling"
+    },
+    {
+      "id": "news",
+      "wav": "audio/news.wav",
+      "truth": "audio/news.txt",
+      "true_speakers": 4,
+      "purpose": "real broadcast audio — anchor, guests, reporter"
+    },
+    {
+      "id": "short_guest",
+      "wav": "audio/short_guest.wav",
+      "truth": "audio/short_guest.txt",
+      "true_speakers": 3,
+      "purpose": "a ~3 s turn: does NEW_IDENTITY_MIN_SEC=6 erase this person?"
+    },
+    {
+      "id": "cross_talk",
+      "wav": "audio/cross_talk.wav",
+      "truth": "audio/cross_talk.txt",
+      "true_speakers": 3,
+      "purpose": "overlap — the known weakness of VAD + embedding + clustering"
+    },
+    {
+      "id": "similar_voices",
+      "wav": "audio/similar_voices.wav",
+      "truth": "audio/similar_voices.txt",
+      "true_speakers": 2,
+      "purpose": "two close centroids must NOT be merged into one speaker"
+    },
+    {
+      "id": "long_recording",
+      "wav": "audio/long_recording.wav",
+      "truth": "audio/long_recording.txt",
+      "true_speakers": 3,
+      "purpose": "identity drift — same speaker must not split late in a session"
+    },
+    {
+      "id": "sinhala_conversation",
+      "wav": "audio/sinhala_conversation.wav",
+      "truth": "audio/sinhala_conversation.txt",
+      "true_speakers": 3,
+      "purpose": "language robustness of the embedding model"
+    },
+    {
+      "id": "sinhala_song",
+      "wav": "audio/sinhala_song.wav",
+      "truth": null,
+      "true_speakers": 0,
+      "purpose": "music rejection — the pass condition is that K stays 0"
+    }
+  ]
+}
