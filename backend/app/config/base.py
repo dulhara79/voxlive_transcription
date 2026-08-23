@@ -123,6 +123,38 @@ class Settings:
     # re-deciding K, and in fixed mode K is forced from here on.
     speaker_establish_sec: float = float(os.getenv("SPEAKER_ESTABLISH_SEC", "8.0"))
 
+    # ---- automatic speaker-count estimation (supervisor review §9/§10/§12) ---
+    # Two centroids further apart than SAME_SPEAKER_MAX are unconditionally
+    # different people; closer than SPEAKER_SEPARATION_FLOOR, unconditionally
+    # the same person. Between the two, the RELATIVE test decides: the gap
+    # between the centroids must exceed SPEAKER_SEPARATION_RATIO times the
+    # combined width of the two clusters. Raising the ratio merges more;
+    # lowering it splits more. Do not tune these from one recording — use
+    # eval_diarization.py over the labelled set.
+    same_speaker_max: float = float(os.getenv("SAME_SPEAKER_MAX", "0.50"))
+    speaker_separation_floor: float = float(
+        os.getenv("SPEAKER_SEPARATION_FLOOR", "0.35")
+    )
+    speaker_separation_ratio: float = float(
+        os.getenv("SPEAKER_SEPARATION_RATIO", "1.10")
+    )
+    # Evidence required to admit a NEW speaker mid-session. The short path
+    # exists for broadcast reporters and one-line contributors, who cannot
+    # clear the normal bar and were previously absorbed into whoever they
+    # sounded least unlike.
+    new_identity_min_sec: float = float(os.getenv("NEW_IDENTITY_MIN_SEC", "6.0"))
+    new_identity_min_windows: int = int(os.getenv("NEW_IDENTITY_MIN_WINDOWS", "4"))
+    new_identity_short_sec: float = float(os.getenv("NEW_IDENTITY_SHORT_SEC", "3.2"))
+    new_identity_short_windows: int = int(os.getenv("NEW_IDENTITY_SHORT_WINDOWS", "3"))
+    new_identity_strong_dist: float = float(
+        os.getenv("NEW_IDENTITY_STRONG_DIST", "0.68")
+    )
+    # How much further trusted audio before AUTO re-asks whether the session
+    # has grown a speaker. The answer is only ever allowed to ADD one.
+    speaker_growth_check_sec: float = float(
+        os.getenv("SPEAKER_GROWTH_CHECK_SEC", "20.0")
+    )
+
     # ---- speech / music gate ----
     # WebRTC VAD answers "does this look like speech?" and sung vocals pass
     # that test comfortably; MIN_SEGMENT_RMS is an ENERGY gate and music is
