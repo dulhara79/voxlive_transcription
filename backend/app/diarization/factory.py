@@ -100,6 +100,41 @@ def build_diarizer(settings, expected_speakers: int, speaker_mode: str = ""):
 
     from .service import DiarizationService
 
+    # §14: SORTFORMER_WINDOW_SEC is inert here. It is only ever read by the
+    # Sortformer branch above, so tuning it while DIARIZATION_BACKEND=embedding
+    # changes nothing — a false lead that already cost one debugging session.
+    # Say so instead of letting the value sit in .env looking effective.
+    sortformer_window = float(getattr(settings, "sortformer_window_sec", 90.0))
+    if abs(sortformer_window - 90.0) > 1e-6:
+        log.warning(
+            "SORTFORMER_WINDOW_SEC=%.0f has NO EFFECT: the active backend is "
+            "'embedding', which does not read it. Changing this value will not "
+            "alter speaker-count estimation. Set DIARIZATION_BACKEND=sortformer "
+            "if you meant to use that backend.",
+            sortformer_window,
+        )
+
+    # §5 of the review: the EFFECTIVE configuration, at the point it is
+    # decided, in one line. The 2-speaker investigation cost days because the
+    # runtime values were only ever visible in a .env file that is not in the
+    # repository, and `-> 2 speaker(s)` looks identical whether the engine
+    # estimated 2 or was ordered to produce 2.
+    log.info(
+        "diarization runtime config: backend=%s speaker_mode=%s "
+        "expected_speakers=%s max_speakers=%d establish=%.1fs%s",
+        backend,
+        mode,
+        expected_speakers or "0 (auto)",
+        settings.max_speakers,
+        float(getattr(settings, "speaker_establish_sec", 8.0)),
+        (
+            f" -> K IS FORCED TO {expected_speakers}; Speaker "
+            f"{expected_speakers + 1} cannot be created"
+            if mode == "fixed" and expected_speakers > 0
+            else " -> K estimated from the audio"
+        ),
+    )
+
     return DiarizationService(
         hf_token=settings.huggingface_token,
         sample_rate=settings.sample_rate,
@@ -110,6 +145,22 @@ def build_diarizer(settings, expected_speakers: int, speaker_mode: str = ""):
         interval_sec=settings.diarize_interval_sec,
         vad_aggressiveness=settings.vad_aggressiveness,
         enabled=settings.diarization_enabled,
+        # §9/§10/§12 tunables. Passed explicitly rather than read from the
+        # global settings inside the engine, so tests can construct an engine
+        # with different values without touching the environment.
+        same_speaker_max=float(getattr(settings, "same_speaker_max", 0.50)),
+        same_speaker_floor=float(getattr(settings, "speaker_separation_floor", 0.35)),
+        separation_ratio=float(getattr(settings, "speaker_separation_ratio", 1.10)),
+        new_identity_min_sec=float(getattr(settings, "new_identity_min_sec", 6.0)),
+        new_identity_min_windows=int(getattr(settings, "new_identity_min_windows", 4)),
+        new_identity_short_sec=float(getattr(settings, "new_identity_short_sec", 3.2)),
+        new_identity_short_windows=int(
+            getattr(settings, "new_identity_short_windows", 3)
+        ),
+        new_identity_strong_dist=float(
+            getattr(settings, "new_identity_strong_dist", 0.68)
+        ),
+        growth_check_sec=float(getattr(settings, "speaker_growth_check_sec", 20.0)),
     )
 
 
