@@ -96,13 +96,26 @@ export function useAudioStream(wsUrl, onMessage) {
   const buildUrl = useCallback(
     (speakers, speakerMode) => {
       const url = new URL(wsUrl);
-      if (speakers > 0) url.searchParams.set("speakers", String(speakers));
-      // auto  -> the backend estimates K; `speakers` is only a ceiling.
-      // fixed -> the backend uses EXACTLY `speakers` identities and will not
-      //          collapse them mid-session. Only meaningful with speakers > 0.
-      if (speakerMode === "fixed" && speakers > 0) {
-        url.searchParams.set("speaker_mode", "fixed");
-      }
+
+      // BOTH PARAMETERS ARE ALWAYS SENT (supervisor review §4). This used to
+      // omit them in Auto mode, on the reasoning that "no parameter" is the
+      // safe default. It is not: an omitted parameter makes the backend fall
+      // back to SPEAKER_MODE and EXPECTED_SPEAKERS from its .env — and while
+      // those shipped as `fixed` and `2`, choosing "Auto — unknown count" in
+      // the UI silently started a session locked to exactly two speakers.
+      // The selector said Auto and the engine was told fixed=2.
+      //
+      // The .env values are the SERVER's default for clients that say nothing.
+      // This client says something, every time, so what the user picked in the
+      // dropdown is what runs.
+      //
+      // auto  -> the backend estimates K; `speakers` is only a ceiling, and 0
+      //          means "no ceiling beyond MAX_SPEAKERS".
+      // fixed -> the backend uses EXACTLY `speakers` identities: it will not
+      //          collapse them mid-session and cannot create one more.
+      const mode = speakerMode === "fixed" && speakers > 0 ? "fixed" : "auto";
+      url.searchParams.set("speakers", String(Math.max(0, speakers || 0)));
+      url.searchParams.set("speaker_mode", mode);
 
       // Identity. Sent on EVERY connection: the backend closes 1008 without it.
       const token = getStoredToken();
