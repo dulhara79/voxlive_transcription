@@ -88,6 +88,41 @@
       "purpose": "language robustness of the embedding model"
     },
     {
+      "id": "tamil_conversation",
+      "wav": "audio/tamil_conversation.wav",
+      "truth": "audio/tamil_conversation.txt",
+      "true_speakers": 3,
+      "purpose": "the third deployment language — WeSpeaker's Tamil behaviour is assumed, not measured"
+    },
+    {
+      "id": "mixed_language",
+      "wav": "audio/mixed_language.wav",
+      "truth": "audio/mixed_language.txt",
+      "true_speakers": 3,
+      "purpose": "Sinhala/English/Tamil code-switching — does a speaker's embedding move when they switch language mid-turn?"
+    },
+    {
+      "id": "news_sinhala",
+      "wav": "audio/news_sinhala.wav",
+      "truth": "audio/news_sinhala.txt",
+      "true_speakers": 3,
+      "purpose": "broadcast audio in the primary deployment language: compression, music bed, voice-over"
+    },
+    {
+      "id": "panel_five",
+      "wav": "audio/panel_five.wav",
+      "truth": "audio/panel_five.txt",
+      "true_speakers": 5,
+      "purpose": "the top of the range MAX_SPEAKERS=6 permits — over-clustering shows up here first"
+    },
+    {
+      "id": "monologue",
+      "wav": "audio/monologue.wav",
+      "truth": "audio/monologue.txt",
+      "true_speakers": 1,
+      "purpose": "the over-clustering control. One person, animated delivery. Any K>1 is a phantom speaker and means SPEAKER_SEPARATION_RATIO is too low"
+    },
+    {
       "id": "sinhala_song",
       "wav": "audio/sinhala_song.wav",
       "truth": null,
