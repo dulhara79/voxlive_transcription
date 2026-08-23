@@ -15,10 +15,12 @@ Same code, same session length, opposite outcome — which is the point. The
 behaviour was never random.
 
 WHAT EACH TEST PINS
-  test_auto_mode_collapses_a_close_pair   the defect still exists in AUTO, and
-                                          is *documented* rather than silently
-                                          fixed, because auto genuinely cannot
-                                          know the pair is two people
+  test_auto_mode_separates_a_close_pair   v13 §9: AUTO now SEPARATES the close
+                                          pair instead of merging it. Under v12
+                                          this same test asserted the merge, on
+                                          the grounds that auto could not know
+                                          the pair was two people; the relative
+                                          separation test is how it now can.
   test_fixed_mode_holds_two_speakers      FIX #1: speaker_mode="fixed" keeps
                                           K=2 on the identical audio
   test_fixed_mode_never_collapses_live    FIX #3: and keeps it across many
@@ -100,8 +102,24 @@ def stream(eng: SpeakerEngine, turns, start=0.0, chunk=4):
 # ---------------------------------------------------------------- the defect
 
 
-def test_auto_mode_collapses_a_close_pair():
-    """AUTO on a ~0.43-separated pair returns ONE speaker. This is the veto."""
+def test_auto_mode_separates_a_close_pair():
+    """v13 (§9). AUTO on the ~0.43-separated pair now returns TWO speakers.
+
+    THIS TEST USED TO ASSERT THE OPPOSITE. Under v12 it read
+
+        assert n == 1, "expected the documented collapse to 1"
+
+    and it was correct to: the hard veto threw away any K whose two closest
+    centroids sat inside SAME_SPEAKER_MAX, so two real people at 0.43 were
+    merged and the only escape was for the user to select FIXED. The review's
+    §9 asks for that veto to stop over-clustering WITHOUT merging genuinely
+    different but acoustically similar speakers, so the absolute veto became a
+    relative one: the gap (0.44) must beat the combined width of the two
+    clusters (0.18 + 0.19), which it does at ratio 1.19.
+
+    `test_monologue_caveat_is_real` is the other half of this and must keep
+    passing — one person split in two scores ratio ~0.37 and is still refused.
+    """
     a = voice(21)
     b = near_voice(a, 22, mix=1.35)
     eng = SpeakerEngine(expected_speakers=0, max_speakers=6)
@@ -109,8 +127,8 @@ def test_auto_mode_collapses_a_close_pair():
     eng.add_windows(wins)
     eng.recluster()
     n = n_speakers(eng)
-    assert n == 1, f"expected the documented collapse to 1, got {n}"
-    print(f"  AUTO, centroids ~0.43 apart: collapses to {n} speaker (the defect)  OK")
+    assert n == 2, f"two similar-sounding people should now separate, got {n}"
+    print(f"  AUTO, centroids ~0.43 apart: {n} speakers (was 1 in v12)  OK")
 
 
 def test_fixed_mode_holds_two_speakers():
@@ -213,7 +231,7 @@ def test_monologue_caveat_is_real():
 if __name__ == "__main__":
     print("Speaker-collapse regression tests (supervisor review P0)")
     for fn in [
-        test_auto_mode_collapses_a_close_pair,
+        test_auto_mode_separates_a_close_pair,
         test_fixed_mode_holds_two_speakers,
         test_fixed_mode_never_collapses_live,
         test_established_identities_survive_live_passes,
