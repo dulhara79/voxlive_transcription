@@ -143,6 +143,13 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist, pdist, squareform
 
+from .calibration import Band, blend, estimate_band, knn_spread
+from .changepoint import (
+    PEAK_FLOOR_FRAC,
+    detect_change_points,
+    mark_straddling,
+)
+
 log = logging.getLogger("voxlive.speaker")
 
 # ---- window geometry -------------------------------------------------------
@@ -155,42 +162,11 @@ TRUST_SEC = 1.80
 FRAME_SEC = 0.25
 
 # ---- calibration -----------------------------------------------------------
-# Two cluster centroids further apart than this are UNCONDITIONALLY different
-# people. It is applied between CENTROIDS (averages over many seconds), never
-# between individual short windows — which is why it can be a constant at all.
-#
-# v13 (supervisor review §9): this stopped being a VETO and became a fast path.
-# In v12 a candidate K was thrown away whenever its two closest centroids sat
-# inside 0.50, which is the documented failure mode of the review's "Video 2":
-# two genuinely different people who happen to sound alike land at 0.43 and get
-# merged. See `_separation_verdict` for the test that replaced the veto.
+# Two cluster centroids closer than this are the same person. This is the only
+# distance threshold left, and it is applied between CENTROIDS (averages over
+# many seconds), never between individual short windows — which is why it can
+# be a constant at all.
 SAME_SPEAKER_MAX = 0.50
-
-# Absolute floor under the relative test below. Under this distance the two
-# centroids are the same voice no matter how tight the clusters are, and the
-# relative test is not consulted. A monologue split in two lands at ~0.11.
-SAME_SPEAKER_FLOOR = 0.35
-
-# The relative separation test (§9). Two clusters are two PEOPLE when the gap
-# between their centroids is larger than the clusters are wide:
-#
-#     d(c_i, c_j)  >=  SEPARATION_RATIO * (radius_i + radius_j)
-#
-# where radius is the weighted mean distance from a cluster's members to its
-# own centroid. Measured on the review's own geometry:
-#
-#     one person split in two   d=0.11  r=0.12+0.19   ratio 0.37   rejected
-#     the 0.43 "similar" pair   d=0.44  r=0.18+0.19   ratio 1.19   accepted
-#     two clear speakers        d=0.72  r=0.19+0.19   ratio 1.95   accepted
-#
-# This is what lets the engine keep protecting the one-speaker case (the whole
-# reason the veto existed) while no longer merging real people at 0.43.
-SEPARATION_RATIO = 1.10
-
-# A candidate K in which any cluster holds fewer windows than this is not a
-# speaker structure — it is one good cluster plus debris. Without this guard a
-# singleton cluster has radius 0.0, which makes the ratio above meaningless.
-CANDIDATE_MIN_WINDOWS = 3
 
 # Gate for re-associating a cluster with an identity seen in earlier passes.
 IDENTITY_MATCH_MAX = 0.55
@@ -250,26 +226,35 @@ CENTROID_UPDATE_RATE = 0.15
 NEW_IDENTITY_MIN_SEC = 6.0
 NEW_IDENTITY_MIN_WINDOWS = 4
 
-# v13 (§10): the short-speaker path. A news reporter who says eight seconds and
-# leaves cannot clear 6.0 s of TRUSTED windows, and in v12 they were silently
-# absorbed into whoever they sounded least unlike. They are admitted here on a
-# smaller amount of audio, but only against a much harder distance bar and a
-# strict internal-coherence bar — which is exactly the combination a music
-# sting, a jingle or a turn boundary cannot produce, because noise is unlike
-# everything INCLUDING ITSELF.
-NEW_IDENTITY_SHORT_SEC = 3.2
-NEW_IDENTITY_SHORT_WINDOWS = 3
-NEW_IDENTITY_STRONG_DIST = 0.68
+# ---- v13: the unexplained-audio watchdog -----------------------------------
+# Trusted audio that fits NO established centroid before a full re-derivation is
+# forced, overriding establishment.
+#
+# WHY THIS EXISTS
+# ---------------
+# `_established` freezes K after ESTABLISH_SEC of trusted audio. That audio is
+# whatever happened to arrive first, and in a real recording the first eight
+# seconds are very often ONE person — someone presses record and starts talking
+# before anyone else says anything. The count then freezes at 1, and the only
+# route to a second identity is `_discover`, which is deliberately narrow: it
+# needs a coherent block of audio far from every centroid, and by the time
+# enough of it exists the EMA in `_adapt` has already dragged the single
+# centroid toward the mixture of both voices, so nothing looks far any more.
+#
+# The watchdog closes that trap. It does not tune a threshold; it notices that
+# the model is failing to explain the audio and rebuilds it. Establishment
+# still does its job — stopping a marginally better silhouette from deleting a
+# speaker every four seconds — but it can no longer outrank evidence.
+REDERIVE_UNEXPLAINED_SEC = 5.0
 
-# The far windows backing a new identity must agree with each other at least
-# this well. Enforced on both the normal and the short path.
-NEW_IDENTITY_MAX_RADIUS = 0.40
+# Total trusted audio required before a forced re-derivation may fire, so a
+# session cannot re-cluster on its second pass over a stray noise burst.
+REDERIVE_MIN_SESSION_SEC = 10.0
 
-# v13 (§12): AUTO mode only. Trusted audio accumulated after establishment
-# before the engine re-examines whether the session has grown a speaker the
-# incremental discovery path missed. The re-examination may only ever ADD
-# identities — see `_growth_check`.
-GROWTH_CHECK_SEC = 20.0
+# v13: windows sampled when re-estimating the band on the cheap (established)
+# path. 300 windows is 45k pairwise distances — microseconds — while the full
+# CLUSTER_SAMPLE_CAP of 800 would be 320k on every single pass.
+ADAPT_CALIB_CAP = 300
 
 
 def l2norm(v: np.ndarray) -> np.ndarray:
@@ -284,6 +269,10 @@ class Window:
     end: float
     embedding: np.ndarray
     prev: int = -1  # last display id assigned to this window
+    # v13: False when a detected speaker change falls inside this window, so
+    # the embedding is a mixture of two voices rather than one person's
+    # fingerprint. Set by `_mark_turn_boundaries`; see changepoint.py.
+    pure: bool = True
 
     @property
     def duration(self) -> float:
@@ -291,7 +280,14 @@ class Window:
 
     @property
     def trusted(self) -> bool:
-        return self.duration >= TRUST_SEC
+        """May this window help decide WHO EXISTS?
+
+        Long enough to carry identity, and not straddling a turn change. A
+        window that fails either test is still LABELLED — dropping it would
+        leave a hole in the transcript's speaker timeline — it simply does not
+        get a vote on how many people are in the room.
+        """
+        return self.pure and self.duration >= TRUST_SEC
 
 
 @dataclass
@@ -323,37 +319,34 @@ class SpeakerEngine:
         identity_match_max: float = IDENTITY_MATCH_MAX,
         recluster_after_sec: float = RECLUSTER_AFTER_SEC,
         establish_sec: float = ESTABLISH_SEC,
-        same_speaker_floor: float = SAME_SPEAKER_FLOOR,
-        separation_ratio: float = SEPARATION_RATIO,
-        new_identity_min_sec: float = NEW_IDENTITY_MIN_SEC,
-        new_identity_min_windows: int = NEW_IDENTITY_MIN_WINDOWS,
-        new_identity_short_sec: float = NEW_IDENTITY_SHORT_SEC,
-        new_identity_short_windows: int = NEW_IDENTITY_SHORT_WINDOWS,
-        new_identity_strong_dist: float = NEW_IDENTITY_STRONG_DIST,
-        growth_check_sec: float = GROWTH_CHECK_SEC,
+        calibrate: bool = True,
+        separation_margin: float = 0.0,
+        detect_turns: bool = True,
         split_distance: float = 0.0,  # accepted for compatibility, unused
         **_ignored,
     ):
         self.expected_speakers = max(0, int(expected_speakers))
         self.max_speakers = max(1, int(max_speakers))
         self.same_speaker_max = float(same_speaker_max)
-        # v13 §9 — the relative separation test that replaced the hard veto.
-        self.same_speaker_floor = min(float(same_speaker_floor), self.same_speaker_max)
-        self.separation_ratio = float(separation_ratio)
-        # v13 §10 — new-identity evidence, normal path and short-speaker path.
-        self.new_identity_min_sec = float(new_identity_min_sec)
-        self.new_identity_min_windows = int(new_identity_min_windows)
-        self.new_identity_short_sec = float(new_identity_short_sec)
-        self.new_identity_short_windows = int(new_identity_short_windows)
-        self.new_identity_strong_dist = float(new_identity_strong_dist)
-        # v13 §12 — post-establishment upward-only re-examination.
-        self.growth_check_sec = float(growth_check_sec)
         self.min_cluster_sec = float(min_cluster_sec)
         self.min_cluster_frac = float(min_cluster_frac)
         self.median_frames = int(median_frames) | 1
         self.identity_match_max = float(identity_match_max)
         self.recluster_after_sec = float(recluster_after_sec)
         self.establish_sec = float(establish_sec)
+
+        # ---- v13: session-adaptive distance band ---------------------------
+        # `same_speaker_max` above is now only a FALLBACK, used when there is
+        # too little audio to estimate anything. With calibration on, the
+        # threshold that decides whether two centroids are two people is
+        # measured from this recording. See calibration.py for why a constant
+        # cannot work: cosine distance moves with the microphone and the room,
+        # so 0.50 is right for some recordings and catastrophically wrong for
+        # others — and when it is wrong in the low direction, EVERY K >= 2 is
+        # vetoed and the whole session collapses onto one speaker.
+        self.calibrate = bool(calibrate)
+        self.separation_margin = float(separation_margin) or 0.0
+        self._band: Optional[Band] = None
 
         # ---- v12: mode ----------------------------------------------------
         # "auto"  -> estimate K; expected_speakers is a CEILING (v11 behaviour,
@@ -393,53 +386,127 @@ class SpeakerEngine:
         self._timeline: list[tuple[float, float, int]] = []
         self._next_key = 0
         self._new_trusted_sec = 0.0
-        # v13 §12: trusted audio since the last upward-only growth check.
-        self._since_growth_sec = 0.0
 
         # v12: True once there is enough trusted audio for the speaker
         # structure to count as evidence rather than a guess. After this, live
         # passes adapt centroids but never re-decide K.
         self._established = False
 
-        # §5 of the review: the runtime configuration must be READABLE in the
-        # log, because the whole 2-speaker investigation came down to a .env
-        # value nobody could see at run time.
-        log.info("SpeakerEngine v13 runtime config: %s", self.describe())
+        # v13: trusted audio that no current centroid explains. Drives the
+        # watchdog above.
+        self._unexplained_sec = 0.0
 
-    def describe(self) -> str:
-        """One-line statement of what this engine will actually do.
+        # v13: speaker change times found from the window embeddings. Used to
+        # demote straddling windows out of the trusted set, and handed to
+        # `split_points()` so the transcript is cut at turn changes even when
+        # the frame vote did not move.
+        self._change_points: list[float] = []
+        self.detect_turns = bool(detect_turns)
 
-        Deliberately spells out the CONSEQUENCE of the mode rather than only
-        the settings, so a log reader does not have to remember which of
-        expected_speakers/max_speakers is load-bearing in which mode.
-        """
-        if self.speaker_mode == "fixed":
-            what = (
-                f"K FORCED to exactly {self.expected_speakers} — "
-                f"Speaker {self.expected_speakers + 1} can never be created"
-            )
-        else:
-            what = f"K ESTIMATED from the audio, 1..{self.cap}"
-        return (
-            f"speaker_mode={self.speaker_mode}, "
-            f"expected_speakers={self.expected_speakers}, "
-            f"max_speakers={self.max_speakers}, cap={self.cap}, "
-            f"establish={self.establish_sec:.1f}s, "
-            f"same_speaker_max={self.same_speaker_max:.2f}, "
-            f"separation_floor={self.same_speaker_floor:.2f}, "
-            f"separation_ratio={self.separation_ratio:.2f} -> {what}"
+        log.info(
+            "SpeakerEngine v13: mode=%s, %s, cap=%d, establish=%.1fs, "
+            "calibration=%s",
+            self.speaker_mode,
+            (
+                f"K={self.expected_speakers} (forced)"
+                if self.speaker_mode == "fixed"
+                else "K estimated"
+            ),
+            self.cap,
+            self.establish_sec,
+            "on" if self.calibrate else f"OFF (constant {self.same_speaker_max})",
         )
 
     # --------------------------------------------------------------- ingest
+
+    # ------------------------------------------------------- distance scale
+
+    def _thr(self) -> Band:
+        """The thresholds in force right now.
+
+        Returns the calibrated band when one exists, otherwise a Band built
+        from the static `same_speaker_max`. The Band's derived properties are
+        chosen so that a static band of 0.50 reproduces v12's constants
+        exactly — ambiguous margin 0.05, outlier 0.75, identity match 0.55 —
+        which means turning calibration off restores the previous behaviour
+        rather than approximating it.
+        """
+        if self.calibrate and self._band is not None:
+            return self._band
+        return Band(
+            same_max=self.same_speaker_max,
+            n_windows=0,
+            raw_estimate=self.same_speaker_max,
+            clamped=False,
+        )
+
+    def _recalibrate(self, dist_square: np.ndarray) -> Band:
+        """Re-estimate the same-speaker band from a square distance matrix.
+
+        Smoothed into the running value so one noisy pass cannot move the
+        threshold far enough to change K — that instability is exactly what the
+        v12 establishment logic exists to prevent, and a jumpy threshold would
+        reintroduce it through the back door.
+        """
+        if not self.calibrate:
+            return self._thr()
+        kwargs = {}
+        if self.separation_margin > 0:
+            kwargs["margin"] = self.separation_margin
+        fresh = estimate_band(
+            dist_square,
+            fallback=self.same_speaker_max,
+            neighbours=CORE_NEIGHBOURS,
+            **kwargs,
+        )
+        self._band = blend(self._band, fresh)
+        return self._band
+
+    # ------------------------------------------------------ turn boundaries
+
+    def _mark_turn_boundaries(self) -> None:
+        """Find speaker changes and demote the windows that straddle them.
+
+        Runs on every pass because the boundary set grows with the session, and
+        because a window at the buffer edge on one pass has neighbours on the
+        next. It costs one dot product per window against a window two
+        positions later — the embeddings already exist, so there is no model
+        work here at all.
+        """
+        if not self.detect_turns or len(self.windows) < 8:
+            return
+        spans = [(w.start, w.end) for w in self.windows]
+        embs = np.stack([w.embedding for w in self.windows])
+        # The absolute floor is tied to the measured same-speaker band: a
+        # boundary must separate its two sides by more than two windows of one
+        # person typically differ. Without it, the curve's local maxima turn a
+        # monologue into a dozen phantom turns and the transcript into
+        # fragments.
+        self._change_points = detect_change_points(
+            spans, embs, min_height=PEAK_FLOOR_FRAC * self._thr().same_max
+        )
+        straddling = mark_straddling(spans, self._change_points)
+        for w, bad in zip(self.windows, straddling):
+            w.pure = not bool(bad)
+
+    def change_points(self) -> list[float]:
+        """Detected speaker change times, ascending.
+
+        `DiarizationService.split_points` unions these with the timeline's own
+        changes. That matters for the transcript: the frame vote is smoothed
+        and short runs are absorbed, so a real turn change can leave no trace
+        in the timeline while still being clearly visible in the distance
+        curve. Without this, the two speakers end up in one paragraph and
+        `unsplit_chunks` logs it after the fact.
+        """
+        return list(self._change_points)
 
     def add_windows(self, windows: list[Window]) -> None:
         if not windows:
             return
         self.windows.extend(windows)
         self.windows.sort(key=lambda w: w.start)
-        added = sum(w.duration for w in windows if w.trusted)
-        self._new_trusted_sec += added
-        self._since_growth_sec += added
+        self._new_trusted_sec += sum(w.duration for w in windows if w.trusted)
 
     def n_windows(self) -> int:
         return len(self.windows)
@@ -465,7 +532,14 @@ class SpeakerEngine:
         four seconds of audio could delete a speaker that ninety seconds of
         audio had established. That is the collapse this method now prevents.
         """
+        self._mark_turn_boundaries()
+
         trusted = [w for w in self.windows if w.trusted]
+        if len(trusted) < 2:
+            # Every window straddles a turn change, or there are too few. Fall
+            # back to length alone rather than refusing to cluster: a wrong
+            # speaker count beats no labels at all.
+            trusted = [w for w in self.windows if w.duration >= TRUST_SEC]
         if len(trusted) < 2:
             return False
 
@@ -497,7 +571,13 @@ class SpeakerEngine:
                 if not self._derive_clusters(trusted):
                     return False
                 self._new_trusted_sec = 0.0
-                if self._trusted_sec(trusted) >= self.establish_sec:
+                # v13: never establish against an UNMEASURED distance scale.
+                # With calibration on, the first pass or two run on the static
+                # fallback because there are too few windows to estimate from.
+                # Freezing K on that verdict is how a session ends up
+                # permanently certain there is one speaker.
+                measured = (not self.calibrate) or self._thr().measured
+                if self._trusted_sec(trusted) >= self.establish_sec and measured:
                     self._established = True
                     log.info(
                         "speaker identities ESTABLISHED after %.1fs of trusted "
@@ -509,11 +589,42 @@ class SpeakerEngine:
                     )
             return self._label_and_build()
 
-        # Established. The expensive, destructive part is simply not run.
+        # Established. The expensive, destructive part is simply not run —
+        # unless the watchdog says the current model no longer describes the
+        # audio, which outranks establishment.
+        if self._needs_rederive(trusted):
+            log.warning(
+                "%.1fs of trusted audio fits no established speaker — forcing "
+                "a full re-derivation (was %d speaker(s))",
+                self._unexplained_sec,
+                len(self._identities),
+            )
+            self._new_trusted_sec = 0.0
+            if self._derive_clusters(trusted):
+                self._unexplained_sec = 0.0
+                return self._label_and_build()
+
         if self._new_trusted_sec >= self.recluster_after_sec:
             self._new_trusted_sec = 0.0
             self._adapt(trusted)
         return self._label_and_build()
+
+    def _needs_rederive(self, trusted: list[Window]) -> bool:
+        """Is there enough trusted audio that no established identity explains?
+
+        Measured against the CURRENT centroids, so it stops firing by itself
+        once a re-derivation has produced identities that cover the audio —
+        there is no separate 'watchdog satisfied' state to keep in step.
+        """
+        if self._centroid_mat is None or not trusted:
+            return False
+        if self._trusted_sec(trusted) < REDERIVE_MIN_SESSION_SEC:
+            return False
+        X = np.stack([w.embedding for w in trusted])
+        dur = np.array([w.duration for w in trusted], dtype=np.float64)
+        best = cdist(X, self._centroid_mat, metric="cosine").min(axis=1)
+        self._unexplained_sec = float(dur[best > self._thr().new_identity_min].sum())
+        return self._unexplained_sec >= REDERIVE_UNEXPLAINED_SEC
 
     @staticmethod
     def _trusted_sec(trusted: list[Window]) -> float:
@@ -534,7 +645,11 @@ class SpeakerEngine:
         # the tree, so with junk present the first splits separate noise from
         # speech instead of separating people, and no choice of K can recover
         # the speaker structure from that tree.
-        core = self._core_mask(squareform(pdist(Xs, metric="cosine")))
+        Dsq_s = squareform(pdist(Xs, metric="cosine"))
+        band = self._recalibrate(Dsq_s)
+        # band=None with calibration off keeps the v12 core rule byte for
+        # byte, so `DIARIZATION_CALIBRATE=false` is a true revert.
+        core = self._core_mask(Dsq_s, band if self.calibrate else None)
         if core.sum() < max(4, self.cap * 2):
             core = np.ones(len(Xs), dtype=bool)
         Xc, wc = Xs[core], ws[core]
@@ -554,15 +669,12 @@ class SpeakerEngine:
                 else np.zeros(len(Xc), dtype=int)
             )
             sil, dmin = self._diagnostics(squareform(Dc), Xc, wc, lab_c, k)
-            table = []
         else:
-            k, sil, dmin, table = self._choose_k(Z, squareform(Dc), Xc, wc)
+            k, sil, dmin = self._choose_k(Z, squareform(Dc), Xc, wc, band)
             if k <= 1:
                 lab_c = np.zeros(len(Xc), dtype=int)
             else:
                 lab_c = fcluster(Z, k, criterion="maxclust") - 1
-            # §6: this is the line that answers "why did it say 2?".
-            log.info("auto-K candidates: %s", self._format_table(table, k))
         cents = self._centroids(Xc, wc, lab_c, max(1, k))
 
         # Refine on the FULL trusted set, twice, ignoring ambiguous and
@@ -570,7 +682,7 @@ class SpeakerEngine:
         # centroid toward its neighbour.
         for _ in range(2):
             lab, margin, best = self._nearest(X, cents)
-            clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
+            clean = (margin >= band.ambiguous_margin) & (best <= band.outlier_max)
             if clean.sum() < len(cents) * 2:
                 break
             cents = self._centroids(
@@ -578,7 +690,7 @@ class SpeakerEngine:
             )
 
         lab, margin, best = self._nearest(X, cents)
-        clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
+        clean = (margin >= band.ambiguous_margin) & (best <= band.outlier_max)
         if forced:
             # Both `_prune` and `_enforce_cap` exist to DELETE clusters, and a
             # deletion here is precisely how a forced K=2 would decay back into
@@ -601,13 +713,14 @@ class SpeakerEngine:
 
         log.info(
             "clusters: %d trusted window(s) (%d sampled) -> %d speaker(s) "
-            "[%s] (silhouette=%.3f, closest centroids=%.3f)",
+            "[%s] (silhouette=%.3f, closest centroids=%.3f, band %s)",
             len(trusted),
             len(Xs),
             len(cents),
             f"K={forced} forced" if forced else "K estimated",
             sil,
             dmin,
+            band.as_log(),
         )
         return True
 
@@ -683,141 +796,70 @@ class SpeakerEngine:
             return np.arange(n)
         return np.unique(np.linspace(0, n - 1, CLUSTER_SAMPLE_CAP).round().astype(int))
 
-    @staticmethod
-    def _radii(X: np.ndarray, w: np.ndarray, lab: np.ndarray, cents: np.ndarray):
-        """Weighted mean distance from each cluster's members to its centroid.
-
-        This is the cluster's WIDTH. The separation test below compares the gap
-        between two centroids against the sum of the two widths, which is the
-        difference between "two people who sound similar" (a real gap between
-        two tight clusters) and "one person cut in half" (no gap worth the
-        name between two halves of one wide cluster).
-        """
-        out = np.zeros(len(cents))
-        for c in range(len(cents)):
-            m = lab == c
-            if not np.any(m) or w[m].sum() <= 0:
-                continue
-            d = cdist(X[m], cents[c][None, :], metric="cosine").ravel()
-            out[c] = float((d * w[m]).sum() / w[m].sum())
-        return out
-
-    def _separation_verdict(
-        self, X: np.ndarray, w: np.ndarray, lab: np.ndarray, cents: np.ndarray
-    ) -> tuple[bool, str, float, float]:
-        """Are these K clusters K different PEOPLE?
-
-        Returns (ok, reason, dmin, ratio). The order of the tests matters:
-
-            1. dmin >= same_speaker_max      unconditionally different people
-                                             (v11/v12 behaviour, unchanged)
-            2. dmin <  same_speaker_floor    unconditionally the same person
-            3. otherwise                     the RELATIVE test — the gap must
-                                             exceed the combined width of the
-                                             two closest clusters
-
-        Step 3 is the whole of §9. v12 had only step 1 and treated everything
-        below it as the same speaker, which is why two real people at 0.43 were
-        merged. Step 2 keeps the one-speaker protection that the veto was there
-        to provide in the first place.
-        """
-        D = squareform(pdist(cents, metric="cosine"))
-        np.fill_diagonal(D, np.inf)
-        i, j = np.unravel_index(int(np.argmin(D)), D.shape)
-        dmin = float(D[i, j])
-
-        rad = self._radii(X, w, lab, cents)
-        width = float(rad[i] + rad[j])
-        ratio = dmin / width if width > 1e-9 else float("inf")
-
-        if dmin >= self.same_speaker_max:
-            return True, "separated", dmin, ratio
-        if dmin < self.same_speaker_floor:
-            return (
-                False,
-                f"same voice (d={dmin:.3f} < {self.same_speaker_floor:.2f})",
-                dmin,
-                ratio,
-            )
-        if ratio >= self.separation_ratio:
-            return True, "separated (relative)", dmin, ratio
-        return (
-            False,
-            f"clusters wider than the gap (ratio={ratio:.2f} < "
-            f"{self.separation_ratio:.2f})",
-            dmin,
-            ratio,
-        )
-
     def _choose_k(
-        self, Z: np.ndarray, Dsq: np.ndarray, X: np.ndarray, w: np.ndarray
-    ) -> tuple[int, float, float, list[dict]]:
-        """Pick K by weighted silhouette among the SEPARABLE candidates.
+        self,
+        Z: np.ndarray,
+        Dsq: np.ndarray,
+        X: np.ndarray,
+        w: np.ndarray,
+        band: Optional[Band] = None,
+    ) -> tuple[int, float, float]:
+        """Pick K by weighted silhouette among Ks whose centroids are all at
+        least `band.same_max` apart.
 
-        Also returns the full candidate table (§6). Until v13 the log said only
-        `-> 2 speaker(s)`, so when the engine chose 2 for a five-person news
-        broadcast there was no way to tell whether K=3 lost on silhouette, was
-        thrown out by the separation rule, or was never evaluated at all. Every
-        candidate now records why it was kept or dropped.
+        The separation veto is what makes K=1 reachable: if every split
+        produces two centroids that are the same voice, no K>=2 is valid and
+        the answer is one speaker. Selection is still silhouette-driven, so a
+        K=2 split that happens to blur two pairs of speakers does not stop K=4
+        from being chosen.
+
+        WHAT CHANGED IN v13, AND WHY IT IS THE WHOLE FIX
+        ------------------------------------------------
+        The veto used to compare against a CONSTANT 0.50. Two different people
+        on one shared microphone in a small room sit at 0.40-0.48 — the same
+        two people on separate headsets sit at 0.75. Nothing about the speakers
+        changes between those recordings; the acoustics do. With the constant,
+        the first recording has NO valid K >= 2, `best_k` keeps its initialiser
+        of 1, and every word in the session is attributed to one person. That
+        is the reported symptom, and `tests/test_speaker_collapse.py` asserted
+        it as intended behaviour.
+
+        The threshold is now measured from the recording itself (see
+        calibration.py). The veto still exists and still protects the
+        one-speaker case — a monologue's within-speaker spread rises with the
+        band, so a bipartition of one voice stays under it — but it no longer
+        depends on the room matching whatever room the constant was tuned in.
         """
+        thr = (band or self._thr()).same_max
         cap = min(self.cap, len(X) - 1)
         best_k, best_sil, best_dmin = 1, 0.0, 1.0
         found = False
-        table: list[dict] = []
-
+        vetoed: list[tuple[int, float]] = []
         for k in range(2, cap + 1):
             lab = fcluster(Z, k, criterion="maxclust") - 1
-            row: dict = {"k": k}
-            table.append(row)
-
             if len(np.unique(lab)) < k:
-                row["rejected"] = "degenerate (linkage produced fewer clusters)"
                 continue
-
-            counts = [int((lab == c).sum()) for c in range(k)]
-            durs = [float(w[lab == c].sum()) for c in range(k)]
-            row["windows"] = counts
-            row["seconds"] = [round(d, 1) for d in durs]
-
-            if min(counts) < CANDIDATE_MIN_WINDOWS:
-                row["rejected"] = (
-                    f"cluster of {min(counts)} window(s) < {CANDIDATE_MIN_WINDOWS}"
-                )
-                continue
-
             cents = self._centroids(X, w, lab, k)
-            ok, why, dmin, ratio = self._separation_verdict(X, w, lab, cents)
-            row["dmin"] = round(dmin, 3)
-            row["ratio"] = round(ratio, 2)
-            if not ok:
-                row["rejected"] = why
+            dmin = float(pdist(cents, metric="cosine").min())
+            if dmin < thr:
+                vetoed.append((k, dmin))
                 continue
-
             sil = self._silhouette(Dsq, lab, w, k)
-            row["silhouette"] = round(sil, 3)
-            row["accepted"] = why
             if not found or sil > best_sil:
                 found, best_k, best_sil, best_dmin = True, k, sil, dmin
-
-        return best_k, best_sil, best_dmin, table
-
-    @staticmethod
-    def _format_table(table: list[dict], selected: int) -> str:
-        """The candidate table as one readable log line (§6/§21)."""
-        parts = []
-        for row in table:
-            k = row["k"]
-            if "rejected" in row:
-                parts.append(f"K={k} REJECTED: {row['rejected']}")
-            else:
-                parts.append(
-                    f"K={k} sil={row.get('silhouette', 0.0):.3f} "
-                    f"dmin={row.get('dmin', 0.0):.3f} "
-                    f"ratio={row.get('ratio', 0.0):.2f} "
-                    f"windows={row.get('windows')} secs={row.get('seconds')}"
-                )
-        parts.append(f"SELECTED K={selected}")
-        return " | ".join(parts)
+        if not found and vetoed:
+            # Every split looked like one voice. That is a legitimate answer
+            # (a monologue), but it is also what a mis-set threshold looks
+            # like, so record the near miss rather than collapsing silently.
+            k_near, d_near = max(vetoed, key=lambda kv: kv[1])
+            log.info(
+                "no K>=2 cleared the separation band (%.3f); closest was K=%d "
+                "at %.3f -> reporting one speaker",
+                thr,
+                k_near,
+                d_near,
+            )
+        return best_k, best_sil, best_dmin
 
     @staticmethod
     def _silhouette(Dsq: np.ndarray, lab: np.ndarray, w: np.ndarray, k: int) -> float:
@@ -884,39 +926,32 @@ class SpeakerEngine:
         part = np.partition(d, 1, axis=1)
         return lab, part[:, 1] - part[:, 0], best
 
-    def _core_mask(self, Dsq: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _core_mask(Dsq: np.ndarray, band: Optional[Band] = None) -> np.ndarray:
         """Keep windows that have neighbours who sound like them.
 
-        A voice recurs: any genuine speaker window has other windows of the
-        same person within same-speaker range. Music, laughter, coughs and
+        A voice recurs: any genuine speaker window has several other windows of
+        the same person within same-speaker range. Music, laughter, coughs and
         chair scrapes do not — they are mutually unrelated, so their nearest
         neighbours are far away. Removing them here is what lets the dendrogram
         spend its top splits on people.
 
-        v13 (§10) — THE FIVE-NEIGHBOUR MEAN PUNISHED SHORT SPEAKERS.
-        The test averaged the FIVE nearest neighbours, so a reporter with three
-        trusted windows was scored on two of their own windows plus three
-        windows belonging to other people:
-
-            (2 * 0.22 + 3 * 0.78) / 5 = 0.556  >  0.50   -> deleted as noise
-
-        A brief but genuine speaker was therefore stripped out before the
-        dendrogram was even built, and no value of K could recover them. A
-        window now also qualifies on its TWO nearest neighbours, against a
-        tighter bar. Noise still fails: a cough has no near neighbour at all,
-        which is the property the filter was actually written to exploit.
+        v13: the cut-off scales with the calibrated band instead of being the
+        same 0.50 that broke the veto. It is also floored at the 70th
+        percentile of the observed spread, so a recording whose within-speaker
+        spread is genuinely wide cannot have most of its speech classified as
+        junk — losing 30% of windows from the dendrogram is recoverable, losing
+        80% is not.
         """
         n = len(Dsq)
         m = min(CORE_NEIGHBOURS, n - 1)
         if m < 1:
             return np.ones(n, dtype=bool)
-        d = Dsq.copy()
-        np.fill_diagonal(d, np.inf)
-        srt = np.sort(d, axis=1)
-        broad = srt[:, :m].mean(axis=1) <= self.same_speaker_max
-        near = min(2, m)
-        tight = srt[:, :near].mean(axis=1) <= 0.85 * self.same_speaker_max
-        return broad | tight
+        knn = knn_spread(Dsq, m)
+        if band is None:
+            return knn <= SAME_SPEAKER_MAX
+        ceiling = max(band.core_max, float(np.percentile(knn, 70.0)))
+        return knn <= ceiling
 
     def _prune(
         self,
@@ -941,44 +976,7 @@ class SpeakerEngine:
         totals = np.array([dur[lab == c].sum() for c in range(len(cents))])
         counts = np.array([int((lab == c).sum()) for c in range(len(cents))])
 
-        # v13 (§10). A relative floor asks "does this cluster own a couple of
-        # percent of the speech?", and in a 400-second news broadcast an
-        # eight-second reporter owns 2 % on a good day. The floor was written
-        # to delete turn-boundary debris, not people, so a cluster that looks
-        # small may still stay IF it looks like a person: clearly separated
-        # from everyone else, and internally coherent. Debris is neither —
-        # boundary windows sit BETWEEN two centroids by construction, and noise
-        # does not agree with itself.
-        rad = self._radii(X, dur, lab, cents)
-        cd = squareform(pdist(cents, metric="cosine")) if len(cents) > 1 else None
-
-        def distinct(c: int) -> bool:
-            if cd is None:
-                return False
-            others = np.delete(cd[c], c)
-            return float(others.min()) >= self.same_speaker_max
-
-        keep = []
-        for c in range(len(cents)):
-            if totals[c] >= floor and counts[c] >= 3:
-                keep.append(c)
-                continue
-            if (
-                counts[c] >= self.new_identity_short_windows
-                and totals[c] >= self.new_identity_short_sec
-                and rad[c] <= NEW_IDENTITY_MAX_RADIUS
-                and distinct(c)
-            ):
-                keep.append(c)
-                log.info(
-                    "prune exemption: cluster %d kept on %.1fs / %d window(s) — "
-                    "coherent (radius=%.3f) and distinct from every other "
-                    "speaker. A brief speaker is not debris.",
-                    c,
-                    totals[c],
-                    counts[c],
-                    rad[c],
-                )
+        keep = [c for c in range(len(cents)) if totals[c] >= floor and counts[c] >= 3]
         if not keep:
             keep = [int(np.argmax(totals))]
         if len(keep) == len(cents):
@@ -1015,9 +1013,10 @@ class SpeakerEngine:
         """Re-assign everything to the surviving centroids, then re-estimate
         them from their new membership. Discarded audio is absorbed by the
         nearest real speaker — never left to spawn its own."""
+        band = self._thr()
         kept = cents[keep]
         lab, margin, best = self._nearest(X, kept)
-        clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
+        clean = (margin >= band.ambiguous_margin) & (best <= band.outlier_max)
         if clean.sum() >= len(kept) * 2:
             kept = self._centroids(
                 X[clean], dur[clean], lab[clean], len(kept), fallback=kept
@@ -1038,9 +1037,14 @@ class SpeakerEngine:
         """
         taken: dict[int, int] = {}
         if self._identities:
+            gate = (
+                self._thr().identity_match_max
+                if (self.calibrate and self._band is not None)
+                else self.identity_match_max
+            )
             prev = np.stack([i.centroid for i in self._identities])
             d = cdist(cents, prev, metric="cosine")
-            cost = np.where(d <= self.identity_match_max, d, 1e3)
+            cost = np.where(d <= gate, d, 1e3)
             for r, c in zip(*linear_sum_assignment(cost)):
                 if cost[r, c] < 1e3:
                     taken[int(r)] = int(c)
@@ -1112,8 +1116,23 @@ class SpeakerEngine:
         dur = np.array([w.duration for w in trusted], dtype=np.float64)
         starts = np.array([w.start for w in trusted], dtype=np.float64)
 
+        # Keep the band current even though K is frozen. A speaker leaning back
+        # from the microphone widens the within-speaker spread over minutes; if
+        # the band did not follow, `_discover` would start reading that drift as
+        # a new person. ADAPT_CALIB_CAP bounds the O(n^2) cost — this method is
+        # the cheap path and must stay cheap.
+        if self.calibrate and len(X) >= 2:
+            idx = (
+                np.linspace(0, len(X) - 1, ADAPT_CALIB_CAP).round().astype(int)
+                if len(X) > ADAPT_CALIB_CAP
+                else np.arange(len(X))
+            )
+            idx = np.unique(idx)
+            self._recalibrate(squareform(pdist(X[idx], metric="cosine")))
+
+        band = self._thr()
         lab, margin, best = self._nearest(X, cents)
-        clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
+        clean = (margin >= band.ambiguous_margin) & (best <= band.outlier_max)
         if clean.sum() >= len(cents):
             target = self._centroids(
                 X[clean], dur[clean], lab[clean], len(cents), fallback=cents
@@ -1129,18 +1148,13 @@ class SpeakerEngine:
         fresh = self._discover(X, dur, cents)
         if fresh is not None:
             cents = np.vstack([cents, fresh])
-            log.info("speaker count is now %d", len(cents))
-
-        # §12: the incremental path above only ever sees a voice that is far
-        # from every centroid RIGHT NOW. A speaker who was folded into someone
-        # else during establishment is invisible to it forever, because they
-        # are no longer far from anything — they ARE part of a centroid. The
-        # growth check re-asks the whole question periodically, and is allowed
-        # to answer only in one direction.
-        if self._since_growth_sec >= self.growth_check_sec:
-            grown = self._growth_check(trusted, cents)
-            if grown is not None:
-                cents = grown
+            log.info(
+                "new speaker identity discovered from %.1fs of audio unlike "
+                "any known voice (band %s) -> %d speaker(s)",
+                NEW_IDENTITY_MIN_SEC,
+                band.as_log(),
+                len(cents),
+            )
 
         lab, _, _ = self._nearest(X, cents)
         spans = [
@@ -1154,99 +1168,6 @@ class SpeakerEngine:
         # one barely moved, so every established identity re-matches itself and
         # keeps its display number. That is what makes labels stable on screen.
         self._register(cents, spans)
-
-    def _growth_check(
-        self, trusted: list[Window], cents: np.ndarray
-    ) -> Optional[np.ndarray]:
-        """Periodic, UPWARD-ONLY re-examination of the speaker count (§12).
-
-        The review asks for a count that can evolve 1 -> 2 -> 3 -> 4 as a
-        session goes on, and for established identities never to be deleted by
-        a later pass (§11). Those two requirements are only compatible if the
-        re-examination is asymmetric, so this one is:
-
-            new K <= current K                       -> discarded, nothing moves
-            an established centroid loses its match  -> discarded, nothing moves
-            new K > current K and all matched        -> adopted
-
-        The result is that a whole-session re-derivation can ADD Speaker 4 but
-        can never take Speaker 2 away, which is exactly the collapse v12 was
-        written to stop. A pass that wants FEWER speakers is not wrong — it is
-        just not trusted live, and `recluster(force=True)` at finalisation is
-        where it gets its say.
-        """
-        self._since_growth_sec = 0.0
-        if self.speaker_mode != "auto" or len(cents) >= self.cap:
-            return None
-
-        X = np.stack([w.embedding for w in trusted])
-        dur = np.array([w.duration for w in trusted], dtype=np.float64)
-
-        sample = self._sample(len(trusted))
-        Xs, ws = X[sample], dur[sample]
-        core = self._core_mask(squareform(pdist(Xs, metric="cosine")))
-        if core.sum() < max(4, self.cap * 2):
-            core = np.ones(len(Xs), dtype=bool)
-        Xc, wc = Xs[core], ws[core]
-        if len(Xc) <= len(cents) + 1:
-            return None
-
-        Dc = pdist(Xc, metric="cosine")
-        Z = linkage(Dc, method="average")
-        k, sil, dmin, table = self._choose_k(Z, squareform(Dc), Xc, wc)
-
-        if k <= len(cents):
-            log.debug(
-                "growth check: no new speaker (K=%d vs %d established) | %s",
-                k,
-                len(cents),
-                self._format_table(table, k),
-            )
-            return None
-
-        lab_c = fcluster(Z, k, criterion="maxclust") - 1
-        grown = self._centroids(Xc, wc, lab_c, k)
-        for _ in range(2):
-            lab, margin, best = self._nearest(X, grown)
-            clean = (margin >= AMBIG_MARGIN) & (best <= OUTLIER_MAX)
-            if clean.sum() < len(grown) * 2:
-                break
-            grown = self._centroids(
-                X[clean], dur[clean], lab[clean], len(grown), fallback=grown
-            )
-
-        # The monotone guard. Every established identity must still be findable
-        # in the new structure, one-to-one — otherwise this is not "we found
-        # another person", it is a re-partition, and re-partitions are what
-        # renumber a transcript out from under the user.
-        cost = cdist(cents, grown, metric="cosine")
-        rows, cols = linear_sum_assignment(cost)
-        worst = float(max(cost[r, c] for r, c in zip(rows, cols)))
-        if worst > self.identity_match_max:
-            log.info(
-                "growth check: K=%d looked better than %d but an established "
-                "identity would have moved %.3f (> %.2f) — DISCARDED, the "
-                "existing speakers stand.",
-                k,
-                len(cents),
-                worst,
-                self.identity_match_max,
-            )
-            return None
-
-        log.info(
-            "growth check ADOPTED: %d -> %d speaker(s) after %.0fs of further "
-            "audio (silhouette=%.3f, closest centroids=%.3f). Every existing "
-            "identity survived (worst move %.3f). | %s",
-            len(cents),
-            k,
-            self.growth_check_sec,
-            sil,
-            dmin,
-            worst,
-            self._format_table(table, k),
-        )
-        return grown
 
     def _discover(
         self, X: np.ndarray, dur: np.ndarray, cents: np.ndarray
@@ -1264,128 +1185,39 @@ class SpeakerEngine:
             coherent   the far windows must sound like EACH OTHER, not merely
                        unlike us — noise is unlike everything including itself
 
-        v13 adds a SHORT path (§10) and, more importantly, a DIAGNOSTIC (§22).
-        Every rejection now says which bar was missed and by how much, so a
-        reporter who should have become Speaker 3 and did not leaves a line
-        saying `windows=3 < 4` rather than nothing at all.
-
         FIXED mode never discovers: the user stated the count.
         """
         if self.speaker_mode == "fixed":
             return None
         if len(cents) >= self.cap:
-            log.debug(
-                "candidate_new_speaker: not evaluated — already at the cap of "
-                "%d identities (raise MAX_SPEAKERS to go further)",
-                self.cap,
-            )
             return None
 
-        d_all = cdist(X, cents, metric="cosine")
-        best = d_all.min(axis=1)
-        far = best > self.same_speaker_max
-        n_far, sec_far = int(far.sum()), float(dur[far].sum())
-
-        def reject(reason: str, **extra) -> None:
-            bits = " ".join(f"{k}={v}" for k, v in extra.items())
-            log.info(
-                "candidate_new_speaker REJECTED (%s): far_windows=%d far_sec=%.1f "
-                "known_speakers=%d %s",
-                reason,
-                n_far,
-                sec_far,
-                len(cents),
-                bits,
-            )
-
-        if n_far == 0:
+        far_thr = self._thr().new_identity_min
+        best = cdist(X, cents, metric="cosine").min(axis=1)
+        far = best > far_thr
+        if int(far.sum()) < NEW_IDENTITY_MIN_WINDOWS:
+            return None
+        if float(dur[far].sum()) < NEW_IDENTITY_MIN_SEC:
             return None
 
-        # The strongest evidence available about this candidate, computed once
-        # so it can be logged whichever way the decision goes.
         Xf, wf = X[far], dur[far]
         cand = l2norm((Xf * (wf / wf.sum())[:, None]).sum(axis=0))
-        agree = (
-            cdist(Xf, cand[None, :], metric="cosine").ravel() <= self.same_speaker_max
-        )
-        n_agree = int(agree.sum())
-        sec_agree = float(wf[agree].sum())
-        if n_agree:
-            Xa, wa = Xf[agree], wf[agree]
-            cand = l2norm((Xa * (wa / wa.sum())[:, None]).sum(axis=0))
-            radius = float(
-                (cdist(Xa, cand[None, :], metric="cosine").ravel() * wa).sum()
-                / max(wa.sum(), 1e-9)
-            )
-        else:
-            radius = 1.0
 
-        d_to_known = cdist(cand[None, :], cents, metric="cosine").ravel()
-        d_min_known = float(d_to_known.min())
-        dists = ", ".join(
-            f"S{i + 1}={d:.3f}" for i, d in enumerate(np.round(d_to_known, 3))
-        )
-
-        # The normal path (plenty of audio) and the short path (little audio,
-        # but unmistakably somebody else and unmistakably self-consistent).
-        normal = (
-            n_agree >= self.new_identity_min_windows
-            and sec_agree >= self.new_identity_min_sec
-        )
-        short = (
-            n_agree >= self.new_identity_short_windows
-            and sec_agree >= self.new_identity_short_sec
-            and d_min_known >= self.new_identity_strong_dist
-        )
-
-        if not (normal or short):
-            reject(
-                "insufficient evidence",
-                agree_windows=n_agree,
-                agree_sec=round(sec_agree, 1),
-                need=f"{self.new_identity_min_windows}w/"
-                f"{self.new_identity_min_sec:.1f}s "
-                f"or {self.new_identity_short_windows}w/"
-                f"{self.new_identity_short_sec:.1f}s at d>="
-                f"{self.new_identity_strong_dist:.2f}",
-                distances=dists,
-                internal_radius=round(radius, 3),
-            )
+        # Coherence: keep only the far windows that agree with the candidate,
+        # then re-check that what remains is still substantial.
+        agree = cdist(Xf, cand[None, :], metric="cosine").ravel() <= far_thr
+        if int(agree.sum()) < NEW_IDENTITY_MIN_WINDOWS:
+            return None
+        if float(wf[agree].sum()) < NEW_IDENTITY_MIN_SEC:
             return None
 
-        if radius > NEW_IDENTITY_MAX_RADIUS:
-            # Unlike everybody INCLUDING ITSELF: music, applause, a jingle, or
-            # a run of turn-boundary windows. This is the guard that keeps the
-            # short path from manufacturing phantom speakers.
-            reject(
-                "not internally consistent",
-                internal_radius=round(radius, 3),
-                limit=NEW_IDENTITY_MAX_RADIUS,
-                agree_windows=n_agree,
-                agree_sec=round(sec_agree, 1),
-                distances=dists,
-            )
-            return None
+        Xa, wa = Xf[agree], wf[agree]
+        cand = l2norm((Xa * (wa / wa.sum())[:, None]).sum(axis=0))
 
-        if d_min_known < self.same_speaker_max:
-            reject(
-                "too close to a known speaker after refinement",
-                distances=dists,
-                nearest=round(d_min_known, 3),
-                limit=self.same_speaker_max,
-            )
+        # Final guard: the candidate must still be a different person from
+        # everyone already registered, measured centroid-to-centroid.
+        if float(cdist(cand[None, :], cents, metric="cosine").min()) < far_thr:
             return None
-
-        log.info(
-            "candidate_new_speaker ACCEPTED (%s path): windows=%d duration=%.1fs "
-            "internal_radius=%.3f distances=[%s] -> Speaker %d",
-            "normal" if normal else "short",
-            n_agree,
-            sec_agree,
-            radius,
-            dists,
-            len(cents) + 1,
-        )
         return cand
 
     # ------------------------------------------------- labelling & timeline
@@ -1436,7 +1268,7 @@ class SpeakerEngine:
             # Confidence: an ambiguous window (two centroids nearly tied) is
             # usually two voices at once. It still votes, quietly.
             conf = float(np.clip(m / 0.15, 0.25, 1.0))
-            if d1 > OUTLIER_MAX:
+            if d1 > self._thr().outlier_max:
                 # Resembles nobody in the room. Keep the label for continuity,
                 # but do not let it decide a turn.
                 conf *= 0.3
@@ -1579,8 +1411,13 @@ class SpeakerEngine:
         self._timeline.clear()
         self._next_key = 0
         self._new_trusted_sec = 0.0
-        self._since_growth_sec = 0.0
         self._established = False
+        self._unexplained_sec = 0.0
+        self._change_points.clear()
+        # The next recording may be a different microphone, a different room or
+        # a different distance from it, so the previous recording's distance
+        # scale is not evidence about this one.
+        self._band = None
 
 
 # ---------------------------------------------------------------------------
