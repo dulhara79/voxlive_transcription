@@ -75,6 +75,9 @@ class DiarizationService:
         vad_aggressiveness: int = 2,
         device: Optional[str] = None,
         enabled: bool = True,
+        calibrate: bool = True,
+        separation_margin: float = 0.0,
+        detect_turns: bool = True,
         **engine_kw,
     ):
         self.sample_rate = sample_rate
@@ -87,6 +90,9 @@ class DiarizationService:
             max_speakers=max_speakers,
             speaker_mode=speaker_mode,
             establish_sec=establish_sec,
+            calibrate=calibrate,
+            separation_margin=separation_margin,
+            detect_turns=detect_turns,
             **engine_kw,
         )
         self.embedder = Embedder(hf_token, device=device, sample_rate=sample_rate)
@@ -335,12 +341,32 @@ class DiarizationService:
     def split_points(self, start: float, end: float) -> list[float]:
         """Speaker-change times strictly inside [start, end).
 
-        This is what replaces v7's hand-rolled change-point detector: the cut
-        points come from the same clustering that decides identity, so a split
-        and its labels can never disagree.
+        TWO SOURCES, UNIONED (v13)
+        --------------------------
+        1. THE TIMELINE. Where the frame vote changes speaker. These cuts agree
+           with the labels by construction, because they come from the same
+           clustering that decides identity.
+
+        2. THE DISTANCE CURVE. Where the window embeddings say the voice
+           changed, whatever the labels ended up saying.
+
+        The second source exists because the timeline is lossy on purpose: the
+        votes are median-filtered and runs shorter than MIN_RUN_SEC are absorbed
+        into a neighbour, so a real but brief turn can vanish from it. A cut
+        that is never made cannot be repaired afterwards — `relabel()` can
+        change who a paragraph belongs to but cannot divide one that turned out
+        to hold two people — so the paragraph keeps both speakers' words for the
+        rest of the session. That is the "sometimes they get mixed together"
+        symptom, and `unsplit_chunks` already counts it at the end of a session.
+
+        Cutting on a boundary the labels did not register costs a paragraph
+        break in the wrong place at worst. Not cutting costs two people sharing
+        one line permanently. The asymmetry is why the union is the right
+        operation here rather than the intersection.
         """
         if not self.enabled:
             return []
+
         cuts: list[float] = []
         prev = None
         for a, b, s in self.engine.timeline():
@@ -349,7 +375,20 @@ class DiarizationService:
             if prev is not None and s != prev and start + 0.35 < a < end - 0.35:
                 cuts.append(a)
             prev = s
-        return cuts
+
+        for t in self.engine.change_points():
+            if start + 0.35 < t < end - 0.35:
+                cuts.append(t)
+
+        if not cuts:
+            return []
+        # Merge cuts that describe the same boundary seen by both sources.
+        cuts.sort()
+        merged = [cuts[0]]
+        for t in cuts[1:]:
+            if t - merged[-1] >= 0.35:
+                merged.append(t)
+        return merged
 
     def stats(self) -> dict:
         return {
@@ -358,6 +397,13 @@ class DiarizationService:
             "speakers": self.engine.speaker_count(),
             "avg_embed_ms": round(self._embed_ms / max(1, self._passes), 1),
             "covered_until": round(self._covered_until, 2),
+            # The calibrated same-speaker band. This is the single most useful
+            # number when speakers are being merged or split: compare it with
+            # the `closest centroids=` value in the clustering log line.
+            "band": round(self.engine._thr().same_max, 3),
+            "turns": len(self.engine.change_points()),
+            "embed_cache": f"{self.embedder.cache_hits}/"
+            f"{self.embedder.cache_hits + self.embedder.cache_misses}",
         }
 
     def reset(self, at: Optional[float] = None) -> None:
