@@ -26,6 +26,7 @@ This module does three things v7 did not:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import Optional
@@ -41,6 +42,30 @@ MIN_EMBED_SEC = 0.90
 
 # Max windows per forward pass. Keeps peak memory bounded on small containers.
 MAX_BATCH = 64
+
+# v13: windows are grouped into buckets this wide and every member is TRIMMED to
+# the shortest in its bucket, so a forward pass never contains zero padding.
+#
+# WHY THIS MATTERS FOR SPEAKER SEPARATION
+# ---------------------------------------
+# WeSpeaker pools statistics over the whole time axis. Zero padding is not
+# neutral to that pool — it drags every padded embedding toward the same
+# "mostly silence" direction, and that direction is shared by every speaker.
+# The effect is to shrink the distance between different people, which is
+# precisely the failure being fixed elsewhere in this change.
+#
+# The previous code sorted by length and padded each batch to its longest
+# member, which bounds the damage but does not remove it: `slice_windows`
+# emits a short tail window at the end of every speech region, so a batch
+# routinely mixes a 0.95 s window with 2.00 s ones and pads the short one with
+# 52% zeros. Trimming 0.10 s off the long end of a >=0.90 s window costs a
+# little speech; padding it with a second of silence costs its identity.
+LENGTH_BUCKET_SEC = 0.10
+
+# Cap on remembered embeddings per session. The service re-presents a WIN_SEC
+# tail of audio on every pass so the same window really is embedded twice;
+# 4096 entries is roughly an hour of 2 s windows at 0.75 s hop.
+CACHE_MAX = 4096
 
 _MODEL_CACHE: dict = {}
 _LOAD_LOCK = threading.Lock()
@@ -97,9 +122,21 @@ class Embedder:
         self.hf_token = hf_token
         self.device = device
         self.sample_rate = sample_rate
-        self._cache: dict[tuple, np.ndarray] = {}
+        # Keyed by the CONTENT of the window, so identical audio presented
+        # twice is embedded once. The module docstring has always claimed this
+        # cache exists; until v13 it was allocated, cleared by `reset()`, and
+        # never read or written by `embed_batch`.
+        self._cache: dict[bytes, np.ndarray] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
         self._model = None
         self._dev = None
+
+    @staticmethod
+    def _key(w: np.ndarray) -> bytes:
+        return hashlib.blake2b(
+            np.ascontiguousarray(w, dtype=np.float32).tobytes(), digest_size=16
+        ).digest()
 
     def _ensure(self):
         if self._model is None:
@@ -114,12 +151,21 @@ class Embedder:
         """
         out: list[Optional[np.ndarray]] = [None] * len(windows)
         todo: list[int] = []
+        keys: dict[int, bytes] = {}
         min_len = int(MIN_EMBED_SEC * self.sample_rate)
 
         for i, w in enumerate(windows):
             if w is None or len(w) < min_len:
                 continue
+            k = self._key(w)
+            hit = self._cache.get(k)
+            if hit is not None:
+                out[i] = hit
+                self.cache_hits += 1
+                continue
+            keys[i] = k
             todo.append(i)
+            self.cache_misses += 1
 
         if not todo:
             return out
@@ -128,19 +174,26 @@ class Embedder:
 
         self._ensure()
 
-        # Pad to the longest window in each batch. WeSpeaker pools over time,
-        # so trailing zeros bias the result — keep batches length-homogeneous
-        # by sorting, which also makes the padding nearly free.
-        todo.sort(key=lambda i: len(windows[i]))
+        # Group into length buckets and TRIM each bucket to its shortest
+        # member, so no forward pass ever contains a padded row. See
+        # LENGTH_BUCKET_SEC for why padding is not neutral here.
+        bucket = max(1, int(LENGTH_BUCKET_SEC * self.sample_rate))
+        groups: dict[int, list[int]] = {}
+        for i in todo:
+            groups.setdefault(len(windows[i]) // bucket, []).append(i)
 
-        for b0 in range(0, len(todo), MAX_BATCH):
-            idxs = todo[b0 : b0 + MAX_BATCH]
-            lens = [len(windows[i]) for i in idxs]
-            width = max(lens)
-            batch = np.zeros((len(idxs), 1, width), dtype=np.float32)
+        batches: list[list[int]] = []
+        for _, members in sorted(groups.items()):
+            for b0 in range(0, len(members), MAX_BATCH):
+                batches.append(members[b0 : b0 + MAX_BATCH])
+
+        for idxs in batches:
+            width = min(len(windows[i]) for i in idxs)
+            if width < min_len:
+                continue
+            batch = np.empty((len(idxs), 1, width), dtype=np.float32)
             for r, i in enumerate(idxs):
-                w = windows[i]
-                batch[r, 0, : len(w)] = w
+                batch[r, 0, :] = windows[i][:width]
 
             try:
                 with torch.inference_mode():
@@ -155,7 +208,10 @@ class Embedder:
             for r, i in enumerate(idxs):
                 v = emb[r].ravel()
                 n = float(np.linalg.norm(v))
-                out[i] = v / n if n > 1e-9 else None
+                vec = v / n if n > 1e-9 else None
+                out[i] = vec
+                if vec is not None and len(self._cache) < CACHE_MAX:
+                    self._cache[keys[i]] = vec
 
         return out
 
@@ -164,3 +220,5 @@ class Embedder:
 
     def reset(self) -> None:
         self._cache.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
