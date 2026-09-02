@@ -58,7 +58,7 @@ class StableSpeakerEngine(SpeakerEngine):
         # watchdog remains evidence-driven rather than timer-driven.
         self.growth_check_sec = max(0.0, float(growth_check_sec))
 
-        self._window_keys: set[tuple[int, int]] = set()
+        self._latest_window_start = float("-inf")
         self._watchdog_seen: set[tuple[int, int]] = set()
         self._watchdog_unexplained_accum = 0.0
         self._watchdog_trigger_pending = False
@@ -66,27 +66,27 @@ class StableSpeakerEngine(SpeakerEngine):
 
     @staticmethod
     def _window_key(w: Window) -> tuple[int, int]:
-        # Millisecond quantisation is much finer than the 0.75 s hop while
-        # tolerating harmless floating-point reconstruction differences.
         return (int(round(w.start * 1000.0)), int(round(w.end * 1000.0)))
 
     def add_windows(self, windows: list[Window]) -> None:
-        """Add only genuinely new timeline windows.
+        """Add only windows that advance the streaming timeline.
 
-        DiarizationService intentionally retains a WIN_SEC tail between passes.
-        That tail is re-windowed on the next pass, so blindly appending it makes
-        historical speech count multiple times and corrupts both clustering and
-        the distance-curve turn detector.
+        The service keeps a WIN_SEC overlap tail. On the following pass VAD can
+        start that retained region at a slightly different point, so the same
+        acoustic material is not guaranteed to have exactly the same
+        (start, end) tuple. A set-of-timestamps check therefore still permits
+        shifted duplicates. Streaming input is chronological, so the invariant
+        we actually need is simpler: a new evidence window must start later
+        than the latest window already accepted.
         """
         if not windows:
             return
         fresh: list[Window] = []
-        for w in windows:
-            key = self._window_key(w)
-            if key in self._window_keys:
+        for w in sorted(windows, key=lambda item: (item.start, item.end)):
+            if w.start <= self._latest_window_start + 1e-3:
                 continue
-            self._window_keys.add(key)
             fresh.append(w)
+            self._latest_window_start = w.start
         if fresh:
             super().add_windows(fresh)
 
@@ -240,3 +240,11 @@ class StableSpeakerEngine(SpeakerEngine):
             for c in range(len(cents))
         ]
         self._register(cents, spans)
+
+    def reset(self) -> None:
+        super().reset()
+        self._latest_window_start = float("-inf")
+        self._watchdog_seen.clear()
+        self._watchdog_unexplained_accum = 0.0
+        self._watchdog_trigger_pending = False
+        self._last_discovery_evidence_sec = 0.0
