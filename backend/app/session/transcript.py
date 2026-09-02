@@ -36,6 +36,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..asr.language_spans import LanguageSpan, languages_in, merge_spans
+
 log = logging.getLogger("voxlive.transcript")
 
 
@@ -48,6 +50,12 @@ class Chunk:
     text: str = ""
     language: str = ""
     speaker: Optional[int] = None  # 0-based; None = not diarized yet
+    # Phase 4: word/phrase-level language structure for THIS chunk's text.
+    # `language` above is the dominant label and stays because the ASR gate
+    # and the speaker colour both key off a single code; this is the
+    # structure. Offsets index `self.text`, so they must be rebased whenever
+    # the text is concatenated into a paragraph — see `paragraphs()`.
+    language_spans: list[LanguageSpan] = field(default_factory=list)
     # Which RECORDING inside this session the chunk belongs to. Bumped by the
     # explicit new-recording control, never by silence. Speaker numbers are
     # only comparable WITHIN one recording: "Speaker 1" in recording 2 is a
@@ -170,7 +178,14 @@ class TranscriptStore:
             # people into one turn.
             if out and out[-1]["_spk"] == spk and out[-1]["recording"] == c.recording:
                 p = out[-1]
+                # REBASE before concatenating. Each chunk's spans index that
+                # chunk's own text; the paragraph is `prev + " " + text`, so
+                # every span from this chunk moves right by len(prev) + 1 for
+                # the joining space. Getting this wrong is silent: the spans
+                # stay well-formed and simply point at the wrong words.
+                shift = len(p["text"]) + 1 if p["text"] else 0
                 p["text"] = f"{p['text']} {c.text}".strip()
+                p["_spans"].extend(sp.shifted(shift) for sp in c.language_spans)
                 p["end"] = round(c.end, 2)
                 p["segment_id"] = c.seg_id
                 if c.language and c.language not in p["_langs"]:
@@ -190,12 +205,20 @@ class TranscriptStore:
                         "recording": c.recording,
                         "_spk": spk,
                         "_langs": [c.language] if c.language else [],
+                        "_spans": list(c.language_spans),
                     }
                 )
 
         for p in out:
             langs = p.pop("_langs")
             p.pop("_spk")
+            # Merge across the chunk joins. Chunk A ending in English followed
+            # by chunk B opening in English is ONE English span, not two: the
+            # boundary is an artefact of VAD segmentation, not a code-switch.
+            # Leaving it unmerged would inflate the switch count that Phase 15
+            # measures as "code-switch accuracy".
+            spans = merge_spans(p.pop("_spans"))
+            p["language_spans"] = [sp.as_dict() for sp in spans]
             # A paragraph can legitimately be code-switched: Sinhala, then an
             # English clause, then back. Report the mix rather than pretending
             # the last chunk's language was the whole paragraph's.
@@ -208,7 +231,14 @@ class TranscriptStore:
             # is why this has not fired in production; anything that sets text
             # without one (a test, a future provider, a postprocess stage)
             # would hit it.
-            p["language"] = langs[0] if len(langs) == 1 else "+".join(langs)
+            # Derive the summary label FROM THE SPANS where they exist, so
+            # the two can never disagree. `_langs` collects one code per
+            # chunk, which cannot see a switch that happened inside a single
+            # chunk — the spans can, and that was the whole point of Phase 4.
+            # Fall back to `_langs` only when the text carried no script at
+            # all (digits, punctuation), where spans are legitimately empty.
+            present = languages_in(spans) or langs
+            p["language"] = present[0] if len(present) == 1 else "+".join(present)
         return out
 
     def diff(self) -> tuple[list[dict], str]:
