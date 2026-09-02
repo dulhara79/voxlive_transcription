@@ -3,10 +3,40 @@ WebSocket message contract (server -> client).
 
 status:      {type:"status", state:"ready|transcribing|stopped"}
 transcript:  {type:"transcript", paragraph_id, segment_id, speaker, language,
-              text, start, end, final, recording}
+              text, start, end, final, recording, language_spans}
 refresh:     {type:"refresh", paragraphs:[<transcript messages>]}
 speakers:    {type:"speakers", count:int}
 error:       {type:"error", segment_id, message}
+
+LANGUAGE_SPANS (new — Phase 4, code-switching)
+  `language` remains a SUMMARY: a single code ("si"), or "+"-joined ("si+en+ta")
+  when a turn mixes languages. Keep using it for colouring and filtering.
+
+  `language_spans` is where the mixing actually lives — an ordered, contiguous,
+  non-overlapping list covering the turn:
+
+      [{"language": "si", "start_char": 0,  "end_char": 4,
+        "start": null, "end": null, "timing": "none"},
+       {"language": "en", "start_char": 5,  "end_char": 40, ...},
+       {"language": "ta", "start_char": 60, "end_char": 76, ...}]
+
+  start_char/end_char index `text` as a Python-style slice, so
+  text[start_char:end_char] is exactly the span. They are derived from Unicode
+  script ranges (Sinhala U+0D80-0DFF, Tamil U+0B80-0BFF, Latin), which are
+  disjoint for these three languages — so the offsets are EXACT, not predicted.
+
+  start/end are absolute session SECONDS and are `null` unless the ASR provider
+  supplied word-level timings. `timing` says which: "none" (no timings
+  available) or "api" (from the provider's own word annotations). They are
+  never interpolated from character position — Sinhala and Tamil agglutinate
+  and English does not, so a constant chars-per-second assumption is biased
+  precisely at the switch boundaries where these times would be used.
+
+  A client must treat `null` timings as absent, not as zero. An empty list is
+  also valid and means the text carries no script at all (a bare number).
+
+  Spans do not survive a `refresh` unchanged: they are recomputed from the
+  chunks each time, so always take them from the message rather than caching.
 
 RECORDING (new)
   `recording` is a 1-based index of which recording inside this session the
