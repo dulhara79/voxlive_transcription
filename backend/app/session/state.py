@@ -752,6 +752,16 @@ class SessionState:
 
             chunk.text = text
             chunk.language = result.language
+            # Phase 4. Spans index `result.text`; they stay valid only while
+            # the text does. `PostProcessor` may rewrite it (ENABLE_POSTPROCESS
+            # is off by default), so recompute rather than carrying offsets
+            # that silently point at the pre-edit string.
+            spans = list(getattr(result, "language_spans", []) or [])
+            if settings.enable_postprocess and text != result.text:
+                from ..asr.language_spans import language_spans as _spans
+
+                spans = _spans(text, result.language)
+            chunk.language_spans = spans
             chunk.speaker = self.diar.label_for(chunk.start, chunk.end)
             if chunk.speaker is None:
                 prev = [
