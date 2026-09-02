@@ -11,23 +11,32 @@ from app.diarization.speaker_engine import Window, l2norm
 from app.diarization.stable_speaker_engine import StableSpeakerEngine
 
 
-def test_overlap_tail_windows_are_not_added_twice():
-    """The service deliberately re-feeds a WIN_SEC tail; the engine must dedupe it."""
+def test_overlap_tail_windows_do_not_duplicate_shifted_history():
+    """A re-windowed overlap tail may shift slightly; old starts must still be ignored."""
     eng = StableSpeakerEngine(calibrate=False, detect_turns=False)
     e = l2norm(np.array([1.0, 0.0, 0.0]))
-    first = [
-        Window(0.0, 2.0, e.copy()),
-        Window(0.75, 2.75, e.copy()),
-    ]
-    eng.add_windows(first)
-
-    # This is what the service overlap tail can produce on the next pass.
     eng.add_windows([
         Window(0.0, 2.0, e.copy()),
         Window(0.75, 2.75, e.copy()),
     ])
 
-    assert eng.n_windows() == 2, "overlap-tail windows were counted as new evidence"
+    # The next pass starts its retained VAD tail on a shifted grid. 0.50 s is
+    # historical overlap; 1.25 s advances the timeline and is genuinely new.
+    eng.add_windows([
+        Window(0.50, 2.50, e.copy()),
+        Window(1.25, 3.25, e.copy()),
+    ])
+
+    assert eng.n_windows() == 3, "shifted overlap history was counted as new evidence"
+
+
+def test_reset_allows_a_new_recording_to_start_at_zero():
+    eng = StableSpeakerEngine(calibrate=False, detect_turns=False)
+    e = l2norm(np.array([1.0, 0.0, 0.0]))
+    eng.add_windows([Window(10.0, 12.0, e.copy())])
+    eng.reset()
+    eng.add_windows([Window(0.0, 2.0, e.copy())])
+    assert eng.n_windows() == 1
 
 
 def test_strong_short_interjection_can_create_new_identity():
@@ -43,7 +52,6 @@ def test_strong_short_interjection_can_create_new_identity():
     )
 
     known = np.stack([l2norm(np.array([1.0, 0.0, 0.0]))])
-    # Two clean 2 s windows from a very different but internally coherent voice.
     x = np.stack([
         l2norm(np.array([0.0, 1.0, 0.02])),
         l2norm(np.array([0.0, 1.0, -0.02])),
