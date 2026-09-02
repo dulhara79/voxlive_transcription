@@ -51,9 +51,10 @@ import io
 import json
 import logging
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
+from .language_spans import LanguageSpan, language_spans, languages_in
 from .validation import clean_transcript, dominant_language
 
 log = logging.getLogger("voxlive.gemini")
@@ -64,7 +65,13 @@ LANG_NAMES = {"si": "Sinhala", "ta": "Tamil", "en": "English"}
 @dataclass
 class ASRResult:
     text: str
-    language: str
+    language: str  # DOMINANT language, for the gate and the paragraph colour
+    # Phase 4: where each language actually sits inside `text`. Derived from
+    # Unicode script ranges, so it is exact rather than predicted — si, ta and
+    # en occupy disjoint blocks. Character offsets only: this provider's model
+    # returns a plain string with no timings. See language_spans.py for why
+    # they are not interpolated.
+    language_spans: list[LanguageSpan] = field(default_factory=list)
 
 
 def _wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -297,4 +304,22 @@ class GeminiProvider:
             )
             lang = detected
 
-        return ASRResult(cleaned, lang)
+        # Phase 4. Built from the CLEANED text, after the script filter has
+        # run: spans must index the string the user will actually see, or the
+        # offsets are meaningless. `lang` is the fallback for text that opens
+        # with a neutral token.
+        spans = language_spans(cleaned, lang)
+        present = languages_in(spans)
+        if len(present) > 1:
+            log.info(
+                "code-switched segment: %s across %d span(s)",
+                "+".join(present),
+                len(spans),
+                extra={
+                    "event": "asr_code_switch",
+                    "languages": present,
+                    "spans": len(spans),
+                },
+            )
+
+        return ASRResult(cleaned, lang, spans)
