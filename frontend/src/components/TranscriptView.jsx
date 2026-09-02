@@ -33,6 +33,16 @@ import { Fragment, useCallback, useMemo, useState } from "react";
 
 const LANG_LABEL = { si: "සිංහල", en: "English", ta: "தமிழ்" };
 
+// Per-language tint for code-switched turns (Phase 4). Deliberately faint:
+// the transcript is for READING, and a turn that switches five times must not
+// look like a ransom note. Colour is a secondary cue only — the `title`
+// attribute names the language, so this never carries meaning by colour alone.
+const LANG_TINT = {
+  si: "rgba(37,99,235,0.10)",
+  ta: "rgba(217,119,6,0.14)",
+  en: "transparent",
+};
+
 // Distinct, colour-blind-safe accents so two speakers never read as one.
 const SPEAKER_COLORS = [
   { bg: "rgba(37,99,235,0.10)", fg: "#1d4ed8", bar: "#2563eb" },
@@ -48,6 +58,53 @@ function speakerStyle(label) {
   return SPEAKER_COLORS[
     (Number.isFinite(n) ? n - 1 : 0) % SPEAKER_COLORS.length
   ];
+}
+
+/**
+ * Render one paragraph's text split by `language_spans`.
+ *
+ * Spans carry start_char/end_char indexing `text` as a JS slice, so this is a
+ * plain substring walk — no re-detection on the client, and no chance of the
+ * client and server disagreeing about where a switch happened.
+ *
+ * The gaps BETWEEN spans are whitespace (the server guarantees contiguity),
+ * and they are emitted verbatim so the sentence still reads normally. A
+ * paragraph with zero or one span renders as plain text: a monolingual turn
+ * should look exactly as it did before Phase 4.
+ */
+function CodeSwitchedText({ text, spans }) {
+  if (!spans || spans.length < 2) {
+    return <p className="leading-relaxed text-neutral-900">{text}</p>;
+  }
+
+  const parts = [];
+  let cursor = 0;
+  spans.forEach((s, i) => {
+    // Whitespace between the previous span and this one.
+    if (s.start_char > cursor) {
+      parts.push(<span key={`g${i}`}>{text.slice(cursor, s.start_char)}</span>);
+    }
+    parts.push(
+      <span
+        key={`s${i}`}
+        title={LANG_LABEL[s.language] ?? s.language}
+        style={{
+          background: LANG_TINT[s.language] ?? "transparent",
+          borderRadius: "2px",
+        }}
+      >
+        {text.slice(s.start_char, s.end_char)}
+      </span>,
+    );
+    cursor = s.end_char;
+  });
+  // Anything after the final span (trailing whitespace, or text the server
+  // could not attribute). Never dropped: the rendered string must always equal
+  // `text` exactly, whatever the spans say.
+  if (cursor < text.length) {
+    parts.push(<span key="tail">{text.slice(cursor)}</span>);
+  }
+  return <p className="leading-relaxed text-neutral-900">{parts}</p>;
 }
 
 function langLabel(code) {
@@ -154,7 +211,7 @@ export default function TranscriptView({ paragraphs }) {
                   {fmtTime(p.start)} – {fmtTime(p.end)}
                 </span>
               </div>
-              <p className="leading-relaxed text-neutral-900">{p.text}</p>
+              <CodeSwitchedText text={p.text} spans={p.language_spans} />
             </div>
           </Fragment>
         );
