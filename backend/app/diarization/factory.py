@@ -98,7 +98,7 @@ def build_diarizer(settings, expected_speakers: int, speaker_mode: str = ""):
             enabled=settings.diarization_enabled,
         )
 
-    from .service import DiarizationService
+    from .stable_service import StableDiarizationService
 
     # §14: SORTFORMER_WINDOW_SEC is inert here. It is only ever read by the
     # Sortformer branch above, so tuning it while DIARIZATION_BACKEND=embedding
@@ -135,7 +135,7 @@ def build_diarizer(settings, expected_speakers: int, speaker_mode: str = ""):
         ),
     )
 
-    return DiarizationService(
+    return StableDiarizationService(
         hf_token=settings.huggingface_token,
         sample_rate=settings.sample_rate,
         expected_speakers=expected_speakers,
