@@ -7,12 +7,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 
-from app.diarization.speaker_engine import SpeakerEngine, Window, l2norm
+from app.diarization.speaker_engine import Window, l2norm
+from app.diarization.stable_speaker_engine import StableSpeakerEngine
 
 
 def test_overlap_tail_windows_are_not_added_twice():
     """The service deliberately re-feeds a WIN_SEC tail; the engine must dedupe it."""
-    eng = SpeakerEngine(calibrate=False, detect_turns=False)
+    eng = StableSpeakerEngine(calibrate=False, detect_turns=False)
     e = l2norm(np.array([1.0, 0.0, 0.0]))
     first = [
         Window(0.0, 2.0, e.copy()),
@@ -31,7 +32,7 @@ def test_overlap_tail_windows_are_not_added_twice():
 
 def test_strong_short_interjection_can_create_new_identity():
     """A coherent ~4 s minority turn must not require the old 6 s discovery floor."""
-    eng = SpeakerEngine(
+    eng = StableSpeakerEngine(
         calibrate=False,
         detect_turns=False,
         new_identity_min_sec=6.0,
@@ -55,7 +56,7 @@ def test_strong_short_interjection_can_create_new_identity():
 
 
 def test_short_discovery_tunables_are_not_silently_ignored():
-    eng = SpeakerEngine(
+    eng = StableSpeakerEngine(
         new_identity_min_sec=7.0,
         new_identity_min_windows=5,
         new_identity_short_sec=2.8,
