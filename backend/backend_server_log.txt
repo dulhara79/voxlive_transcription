@@ -1,0 +1,570 @@
+14:10:11 INFO    voxlive.session    segment 45: 260.82-269.82s (9.00s, max_len) rms=2804  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=45]
+14:10:12 INFO    voxlive.session    audio: 271s received, 45 segment(s), diar={'passes': 749, 'windows': 1050, 'speakers': 2, 'avg_embed_ms': 194.5, 'covered_until': 256.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:10:12 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:14 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=40 event=asr_timeout]
+14:10:14 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=40 event=asr_timeout]
+14:10:15 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:15 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:18 INFO    voxlive.session    segment 46: 269.82-276.63s (6.81s, soft_gap) rms=3030  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=46]
+14:10:18 INFO    voxlive.gemini     language label corrected: model said si, script says en  [event=asr_language_corrected]
+14:10:18 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=40 event=asr_completed]
+14:10:19 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:20 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=40 event=asr_completed]
+14:10:21 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=42 event=asr_timeout]
+14:10:22 INFO    voxlive.session    audio: 281s received, 46 segment(s), diar={'passes': 793, 'windows': 1094, 'speakers': 2, 'avg_embed_ms': 190.2, 'covered_until': 256.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:10:22 WARNING voxlive.gemini     content guard: dropping 3.9s segment (repetition loop)  [event=asr_content_rejected]
+14:10:22 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=43 event=asr_completed]
+14:10:22 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:23 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=46 event=asr_completed]
+14:10:24 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=45 event=asr_completed]
+14:10:25 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=44 event=asr_completed]
+14:10:25 INFO    voxlive.session    segment 47: 276.63-283.71s (7.08s, soft_gap) rms=3071  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=47]
+14:10:26 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=42 event=asr_completed]
+14:10:26 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:31 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=47 event=asr_completed]
+14:10:32 INFO    voxlive.session    audio: 291s received, 47 segment(s), diar={'passes': 834, 'windows': 1135, 'speakers': 2, 'avg_embed_ms': 186.7, 'covered_until': 256.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:10:34 INFO    voxlive.session    segment 48: 283.71-292.59s (8.88s, soft_gap) rms=3159  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=48]
+14:10:35 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:38 INFO    voxlive.session    segment 49: 292.59-297.12s (4.53s, soft_gap) rms=4128  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=49]
+14:10:39 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:39 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=48 event=asr_completed]
+14:10:42 INFO    voxlive.session    audio: 301s received, 49 segment(s), diar={'passes': 872, 'windows': 1173, 'speakers': 2, 'avg_embed_ms': 183.9, 'covered_until': 256.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:10:47 INFO    voxlive.session    segment 50: 297.12-306.12s (9.00s, max_len) rms=4414  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=50]
+14:10:48 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:10:52 INFO    voxlive.session    segment 51: 306.12-310.53s (4.41s, soft_gap) rms=3995  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=51]
+14:10:52 INFO    voxlive.session    audio: 311s received, 51 segment(s), diar={'passes': 895, 'windows': 1196, 'speakers': 2, 'avg_embed_ms': 182.4, 'covered_until': 256.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:10:58 INFO    voxlive.session    segment 52: 310.53-316.83s (6.30s, soft_gap) rms=4401  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=52]
+14:11:00 INFO    voxlive.speaker    clusters: 387 trusted window(s) (387 sampled) -> 2 speaker(s) (silhouette=0.286, closest centroids=0.603)
+14:11:00 INFO    voxlive.speaker    timeline: 1262 window(s) -> 2 speaker(s) [1, 2]
+14:11:01 INFO    voxlive.session    segment 53: 316.83-320.31s (3.48s, soft_gap) rms=3925  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=53]
+14:11:02 INFO    voxlive.session    audio: 321s received, 53 segment(s), diar={'passes': 896, 'windows': 1262, 'speakers': 2, 'avg_embed_ms': 195.4, 'covered_until': 306.76}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:02 INFO    voxlive.speaker    clusters: 397 trusted window(s) (397 sampled) -> 2 speaker(s) (silhouette=0.289, closest centroids=0.603)
+14:11:02 INFO    voxlive.speaker    timeline: 1274 window(s) -> 2 speaker(s) [1, 2]
+14:11:02 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:03 INFO    voxlive.speaker    timeline: 1277 window(s) -> 2 speaker(s) [1, 2]
+14:11:03 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:03 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:06 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=53 event=asr_completed]
+14:11:09 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=49 event=asr_timeout]
+14:11:10 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:11 INFO    voxlive.session    segment 54: 320.37-329.37s (9.00s, max_len) rms=3535  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=54]
+14:11:12 INFO    voxlive.session    audio: 331s received, 54 segment(s), diar={'passes': 899, 'windows': 1278, 'speakers': 2, 'avg_embed_ms': 197.7, 'covered_until': 319.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:12 INFO    voxlive.speaker    clusters: 407 trusted window(s) (407 sampled) -> 2 speaker(s) (silhouette=0.286, closest centroids=0.603)
+14:11:12 INFO    voxlive.speaker    timeline: 1288 window(s) -> 2 speaker(s) [1, 2]
+14:11:12 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:18 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=50 event=asr_timeout]
+14:11:19 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:20 INFO    voxlive.session    segment 55: 329.37-338.37s (9.00s, max_len) rms=3489  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=55]
+14:11:22 INFO    voxlive.speaker    clusters: 420 trusted window(s) (420 sampled) -> 2 speaker(s) (silhouette=0.289, closest centroids=0.604)
+14:11:22 INFO    voxlive.session    audio: 341s received, 55 segment(s), diar={'passes': 901, 'windows': 1301, 'speakers': 2, 'avg_embed_ms': 201.6, 'covered_until': 329.51}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:22 INFO    voxlive.speaker    timeline: 1301 window(s) -> 2 speaker(s) [1, 2]
+14:11:22 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:25 INFO    voxlive.session    segment 56: 338.37-344.31s (5.94s, soft_gap) rms=3644  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=56]
+14:11:27 INFO    voxlive.speaker    clusters: 429 trusted window(s) (429 sampled) -> 2 speaker(s) (silhouette=0.291, closest centroids=0.607)
+14:11:27 INFO    voxlive.speaker    timeline: 1310 window(s) -> 2 speaker(s) [1, 2]
+14:11:32 INFO    voxlive.session    audio: 351s received, 56 segment(s), diar={'passes': 904, 'windows': 1312, 'speakers': 2, 'avg_embed_ms': 203.0, 'covered_until': 344.51}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:32 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=51 event=asr_timeout]
+14:11:32 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:33 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=52 event=asr_timeout]
+14:11:33 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:33 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=54 event=asr_completed]
+14:11:33 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:33 WARNING voxlive.gemini     content guard: dropping 9.0s segment (repetition loop)  [event=asr_content_rejected]
+14:11:33 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=55 event=asr_completed]
+14:11:34 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=49 event=asr_completed]
+14:11:34 INFO    voxlive.session    segment 57: 344.31-353.31s (9.00s, max_len) rms=2993  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=57]
+14:11:35 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=50 event=asr_completed]
+14:11:36 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=51 event=asr_completed]
+14:11:37 INFO    voxlive.speaker    clusters: 444 trusted window(s) (444 sampled) -> 2 speaker(s) (silhouette=0.285, closest centroids=0.602)
+14:11:37 INFO    voxlive.speaker    timeline: 1325 window(s) -> 2 speaker(s) [1, 2]
+14:11:37 INFO    voxlive.session    segment split into 2 turn(s) at 344.76s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:37 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=56 event=asr_completed]
+14:11:37 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:37 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:38 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=52 event=asr_completed]
+14:11:41 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=57 event=asr_completed]
+14:11:41 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=57 event=asr_completed]
+14:11:42 INFO    voxlive.session    audio: 361s received, 57 segment(s), diar={'passes': 905, 'windows': 1325, 'speakers': 2, 'avg_embed_ms': 205.2, 'covered_until': 353.51}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:43 INFO    voxlive.session    segment 58: 353.31-362.31s (9.00s, max_len) rms=2976  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=58]
+14:11:46 INFO    voxlive.speaker    clusters: 457 trusted window(s) (457 sampled) -> 2 speaker(s) (silhouette=0.281, closest centroids=0.598)
+14:11:46 INFO    voxlive.speaker    timeline: 1338 window(s) -> 2 speaker(s) [1, 2]
+14:11:46 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:47 INFO    voxlive.speaker    clusters: 460 trusted window(s) (460 sampled) -> 2 speaker(s) (silhouette=0.280, closest centroids=0.597)
+14:11:47 INFO    voxlive.speaker    timeline: 1341 window(s) -> 2 speaker(s) [1, 2]
+14:11:51 INFO    voxlive.session    segment 59: 362.31-369.36s (7.05s, soft_gap) rms=3621  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=59]
+14:11:51 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=58 event=asr_completed]
+14:11:52 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:52 INFO    voxlive.session    audio: 371s received, 59 segment(s), diar={'passes': 924, 'windows': 1358, 'speakers': 2, 'avg_embed_ms': 206.9, 'covered_until': 363.76}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:54 INFO    voxlive.session    segment 60: 369.36-372.84s (3.48s, soft_gap) rms=3544  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=60]
+14:11:56 INFO    voxlive.speaker    clusters: 470 trusted window(s) (470 sampled) -> 2 speaker(s) (silhouette=0.272, closest centroids=0.584)
+14:11:56 INFO    voxlive.speaker    timeline: 1376 window(s) -> 2 speaker(s) [1, 2]
+14:11:56 INFO    voxlive.speaker    timeline: 1377 window(s) -> 2 speaker(s) [1, 2]
+14:11:56 INFO    voxlive.session    segment split into 2 turn(s) at 371.26s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:11:56 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:56 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:11:56 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=59 event=asr_completed]
+14:11:59 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=60 event=asr_completed]
+14:12:00 INFO    voxlive.session    segment 61: 373.26-378.96s (5.70s, soft_gap) rms=3393  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=61]
+14:12:01 INFO    voxlive.speaker    clusters: 475 trusted window(s) (475 sampled) -> 2 speaker(s) (silhouette=0.278, closest centroids=0.591)
+14:12:01 INFO    voxlive.speaker    timeline: 1383 window(s) -> 2 speaker(s) [1, 2]
+14:12:01 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:01 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=60 event=asr_completed]
+14:12:02 INFO    voxlive.session    audio: 381s received, 61 segment(s), diar={'passes': 934, 'windows': 1383, 'speakers': 2, 'avg_embed_ms': 208.9, 'covered_until': 379.01}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:04 INFO    voxlive.session    segment 62: 378.96-382.89s (3.93s, soft_gap) rms=3834  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=62]
+14:12:05 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=61 event=asr_completed]
+14:12:05 INFO    voxlive.speaker    clusters: 481 trusted window(s) (481 sampled) -> 2 speaker(s) (silhouette=0.275, closest centroids=0.590)
+14:12:06 INFO    voxlive.speaker    timeline: 1390 window(s) -> 2 speaker(s) [1, 2]
+14:12:06 INFO    voxlive.session    segment split into 2 turn(s) at 380.51s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:06 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:06 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:08 INFO    voxlive.session    segment 63: 382.89-387.21s (4.32s, soft_gap) rms=4151  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=63]
+14:12:08 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=62 event=asr_completed]
+14:12:09 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=62 event=asr_completed]
+14:12:10 INFO    voxlive.speaker    clusters: 488 trusted window(s) (488 sampled) -> 2 speaker(s) (silhouette=0.236, closest centroids=0.586)
+14:12:10 INFO    voxlive.speaker    timeline: 1397 window(s) -> 2 speaker(s) [1, 2]
+14:12:10 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:11 INFO    voxlive.speaker    clusters: 491 trusted window(s) (491 sampled) -> 2 speaker(s) (silhouette=0.237, closest centroids=0.588)
+14:12:11 INFO    voxlive.speaker    timeline: 1401 window(s) -> 2 speaker(s) [1, 2]
+14:12:12 INFO    voxlive.session    audio: 391s received, 63 segment(s), diar={'passes': 940, 'windows': 1404, 'speakers': 2, 'avg_embed_ms': 211.3, 'covered_until': 389.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:14 INFO    voxlive.session    segment 64: 387.21-393.00s (5.79s, soft_gap) rms=3671  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=64]
+14:12:15 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:18 INFO    voxlive.session    segment 65: 393.00-396.48s (3.48s, soft_gap) rms=4181  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=65]
+14:12:19 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=64 event=asr_completed]
+14:12:19 INFO    voxlive.speaker    clusters: 500 trusted window(s) (500 sampled) -> 2 speaker(s) (silhouette=0.235, closest centroids=0.586)
+14:12:20 INFO    voxlive.speaker    timeline: 1431 window(s) -> 2 speaker(s) [1, 2]
+14:12:20 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:22 INFO    voxlive.session    audio: 401s received, 65 segment(s), diar={'passes': 967, 'windows': 1439, 'speakers': 2, 'avg_embed_ms': 211.5, 'covered_until': 396.51}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:25 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=65 event=asr_completed]
+14:12:27 INFO    voxlive.session    segment 66: 396.48-405.48s (9.00s, max_len) rms=4526  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=66]
+14:12:28 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:32 INFO    voxlive.session    audio: 411s received, 66 segment(s), diar={'passes': 998, 'windows': 1470, 'speakers': 2, 'avg_embed_ms': 209.9, 'covered_until': 396.51}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:35 INFO    voxlive.session    segment 67: 405.48-413.34s (7.86s, soft_gap) rms=4632  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=67]
+14:12:35 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:37 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=66 event=asr_completed]
+14:12:39 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=67 event=asr_completed]
+14:12:40 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=63 event=asr_timeout]
+14:12:41 INFO    voxlive.speaker    clusters: 524 trusted window(s) (524 sampled) -> 2 speaker(s) (silhouette=0.233, closest centroids=0.582)
+14:12:41 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:41 INFO    voxlive.speaker    timeline: 1509 window(s) -> 2 speaker(s) [1, 2]
+14:12:42 INFO    voxlive.session    audio: 421s received, 67 segment(s), diar={'passes': 1015, 'windows': 1510, 'speakers': 2, 'avg_embed_ms': 212.8, 'covered_until': 415.01}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:44 INFO    voxlive.session    segment 68: 413.34-422.34s (9.00s, max_len) rms=4278  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=68]
+14:12:45 INFO    voxlive.speaker    clusters: 531 trusted window(s) (531 sampled) -> 2 speaker(s) (silhouette=0.232, closest centroids=0.579)
+14:12:45 INFO    voxlive.speaker    timeline: 1517 window(s) -> 2 speaker(s) [1, 2]
+14:12:45 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:50 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=63 event=asr_completed]
+14:12:50 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=68 event=asr_completed]
+14:12:51 INFO    voxlive.speaker    clusters: 539 trusted window(s) (539 sampled) -> 2 speaker(s) (silhouette=0.231, closest centroids=0.576)
+14:12:51 INFO    voxlive.speaker    timeline: 1526 window(s) -> 2 speaker(s) [1, 2]
+14:12:52 INFO    voxlive.session    audio: 431s received, 68 segment(s), diar={'passes': 1017, 'windows': 1526, 'speakers': 2, 'avg_embed_ms': 215.3, 'covered_until': 427.76}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:53 INFO    voxlive.session    segment 69: 422.34-431.34s (9.00s, max_len) rms=4063  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=69]
+14:12:54 INFO    voxlive.speaker    clusters: 545 trusted window(s) (545 sampled) -> 2 speaker(s) (silhouette=0.236, closest centroids=0.587)
+14:12:54 INFO    voxlive.speaker    timeline: 1532 window(s) -> 2 speaker(s) [1, 2]
+14:12:54 INFO    voxlive.session    segment split into 2 turn(s) at 425.51s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:54 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:54 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:56 INFO    voxlive.session    segment 70: 431.34-434.91s (3.57s, soft_gap) rms=3826  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=70]
+14:12:57 INFO    voxlive.speaker    clusters: 551 trusted window(s) (551 sampled) -> 2 speaker(s) (silhouette=0.233, closest centroids=0.582)
+14:12:58 INFO    voxlive.speaker    timeline: 1538 window(s) -> 2 speaker(s) [1, 2]
+14:12:58 INFO    voxlive.session    segment split into 2 turn(s) at 431.76s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:12:58 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:58 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:12:58 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=69 event=asr_completed]
+14:13:01 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=70 event=asr_completed]
+14:13:01 INFO    voxlive.session    segment 71: 434.91-440.10s (5.19s, soft_gap) rms=3332  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=71]
+14:13:02 INFO    voxlive.session    audio: 441s received, 71 segment(s), diar={'passes': 1019, 'windows': 1538, 'speakers': 2, 'avg_embed_ms': 217.1, 'covered_until': 435.01}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:03 INFO    voxlive.speaker    clusters: 559 trusted window(s) (559 sampled) -> 2 speaker(s) (silhouette=0.232, closest centroids=0.581)
+14:13:03 INFO    voxlive.speaker    timeline: 1546 window(s) -> 2 speaker(s) [1, 2]
+14:13:03 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:13:04 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=70 event=asr_completed]
+14:13:07 INFO    voxlive.session    segment 72: 440.16-446.16s (6.00s, soft_gap) rms=4091  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=72]
+14:13:08 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:13:12 INFO    voxlive.session    audio: 451s received, 72 segment(s), diar={'passes': 1050, 'windows': 1576, 'speakers': 2, 'avg_embed_ms': 216.2, 'covered_until': 440.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:13 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=72 event=asr_completed]
+14:13:16 INFO    voxlive.session    segment 73: 446.16-455.16s (9.00s, max_len) rms=3693  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=73]
+14:13:17 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:13:22 INFO    voxlive.session    audio: 461s received, 73 segment(s), diar={'passes': 1083, 'windows': 1609, 'speakers': 2, 'avg_embed_ms': 213.7, 'covered_until': 440.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:24 INFO    voxlive.session    segment 74: 455.16-462.18s (7.02s, flush) rms=3013  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 segment_id=74]
+14:13:24 INFO    voxlive.session    draining 4 in-flight segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:24 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=69 event=asr_timeout]
+14:13:24 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:13:28 INFO    voxlive.speaker    clusters: 587 trusted window(s) (587 sampled) -> 2 speaker(s) (silhouette=0.234, closest centroids=0.579)
+14:13:28 INFO    voxlive.speaker    timeline: 1643 window(s) -> 2 speaker(s) [1, 2]
+14:13:28 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:13:29 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=69 event=asr_completed]
+14:13:30 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=73 event=asr_completed]
+14:13:33 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=74 event=asr_completed]
+14:13:33 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=8021b644 segment_id=71 event=asr_timeout]
+14:13:34 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:13:38 INFO    voxlive.asr.scheduler asr_completed  [session_id=8021b644 segment_id=71 event=asr_completed]
+14:13:39 INFO    voxlive.speaker    clusters: 588 trusted window(s) (588 sampled) -> 2 speaker(s) (silhouette=0.234, closest centroids=0.579)
+14:13:39 WARNING voxlive.session    12 paragraph(s) (75.4s) contain a speaker change that could not be split: the timeline did not cover them when they were cut. Shorten segments (SILENCE_MS / SOFT_MAX_SEGMENT_MS / MAX_SEGMENT_MS) if this stays high.  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644 event=diarization_unsplit]
+14:13:39 INFO    voxlive.session    session done: {'passes': 1090, 'windows': 1644, 'speakers': 2, 'avg_embed_ms': 216.7, 'covered_until': 462.26}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:39 INFO    voxlive.ws         client disconnected after 74 segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:39 INFO    voxlive.sessions   session_closed (duration_sec=483.5, segments=74, active=0)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=8021b644]
+14:13:39 INFO    uvicorn.error      connection closed
+14:16:12 INFO    uvicorn.access     127.0.0.1:2274 - "OPTIONS /auth/me HTTP/1.1" 200
+14:16:12 INFO    uvicorn.access     127.0.0.1:9275 - "OPTIONS /auth/me HTTP/1.1" 200
+14:16:12 INFO    uvicorn.access     127.0.0.1:9275 - "GET /auth/me HTTP/1.1" 200
+14:16:12 INFO    uvicorn.access     127.0.0.1:2274 - "GET /auth/me HTTP/1.1" 200
+14:16:16 INFO    uvicorn.error      127.0.0.1:13434 - "WebSocket /ws/transcribe?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ2b3hsaXZlIiwidHlwIjoiYWNjZXNzIiwic3ViIjoidXNyXzE3ODY5NTM1NTA0MTlfNjY3ZDE0ZWYiLCJvcmciOiJvcmdfMTc4Njk1MzU1MDQxOV83MzZkMDA4NCIsInJvbGUiOiJvd25lciIsImVtYWlsIjoibndhdGNoMTE3QGdtYWlsLmNvbSIsImlhdCI6MTc4Njk1NjM3MiwiZXhwIjoxNzg2OTk5NTcyfQ.WS3wqKyTOHYqjrUqM8WicsvStdVdJKokR7pGuKtO0mc" [accepted]
+14:16:16 INFO    uvicorn.error      connection open
+14:16:16 INFO    voxlive.vad        VADSegmenter ready: rate=16000 frame=30ms aggr=2 silence=450ms soft_max=3500ms max=9000ms min=300ms preroll=250ms
+14:16:16 INFO    voxlive.sessions   session_started (expected_speakers=2, active=1, org_active=1)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=261d7804]
+14:16:19 INFO    voxlive.session    session done: {'passes': 0, 'windows': 0, 'speakers': 0, 'avg_embed_ms': 0.0, 'covered_until': 0.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=261d7804]
+14:16:19 INFO    voxlive.ws         client disconnected after 0 segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=261d7804]
+14:16:19 INFO    voxlive.sessions   session_closed (duration_sec=2.2, segments=0, active=0)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=261d7804]
+14:16:19 INFO    uvicorn.error      connection closed
+14:16:21 INFO    uvicorn.error      127.0.0.1:1521 - "WebSocket /ws/transcribe?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ2b3hsaXZlIiwidHlwIjoiYWNjZXNzIiwic3ViIjoidXNyXzE3ODY5NTM1NTA0MTlfNjY3ZDE0ZWYiLCJvcmciOiJvcmdfMTc4Njk1MzU1MDQxOV83MzZkMDA4NCIsInJvbGUiOiJvd25lciIsImVtYWlsIjoibndhdGNoMTE3QGdtYWlsLmNvbSIsImlhdCI6MTc4Njk1NjM3MiwiZXhwIjoxNzg2OTk5NTcyfQ.WS3wqKyTOHYqjrUqM8WicsvStdVdJKokR7pGuKtO0mc" [accepted]
+14:16:21 INFO    uvicorn.error      connection open
+14:16:21 INFO    voxlive.vad        VADSegmenter ready: rate=16000 frame=30ms aggr=2 silence=450ms soft_max=3500ms max=9000ms min=300ms preroll=250ms
+14:16:21 INFO    voxlive.sessions   session_started (expected_speakers=2, active=1, org_active=1)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:16:30 INFO    voxlive.session    segment 1 gated: rms=119 < 120  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=1]
+14:16:38 INFO    voxlive.session    audio: 10s received, 1 segment(s), diar={'passes': 0, 'windows': 0, 'speakers': 0, 'avg_embed_ms': 0.0, 'covered_until': 0.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:16:39 INFO    voxlive.session    segment 2: 1.98-10.98s (9.00s, max_len) rms=953  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=2]
+14:16:40 INFO    voxlive.speaker    clusters: 6 trusted window(s) (6 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:16:40 INFO    voxlive.speaker    timeline: 7 window(s) -> 1 speaker(s) [1]
+14:16:40 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:16:45 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=2 event=asr_completed]
+14:16:48 INFO    voxlive.session    segment 3: 10.98-19.98s (9.00s, max_len) rms=2463  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=3]
+14:16:48 INFO    voxlive.session    audio: 20s received, 3 segment(s), diar={'passes': 1, 'windows': 7, 'speakers': 1, 'avg_embed_ms': 1142.2, 'covered_until': 11.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:16:50 INFO    voxlive.speaker    clusters: 19 trusted window(s) (19 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:16:50 INFO    voxlive.speaker    timeline: 20 window(s) -> 1 speaker(s) [1]
+14:16:50 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:16:57 INFO    voxlive.session    segment 4: 19.98-28.98s (9.00s, max_len) rms=3082  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=4]
+14:16:58 INFO    voxlive.session    audio: 30s received, 4 segment(s), diar={'passes': 2, 'windows': 20, 'speakers': 1, 'avg_embed_ms': 1622.0, 'covered_until': 20.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:16:59 INFO    voxlive.speaker    clusters: 32 trusted window(s) (32 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:16:59 INFO    voxlive.speaker    timeline: 33 window(s) -> 1 speaker(s) [1]
+14:16:59 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:06 INFO    voxlive.session    segment 5: 28.98-37.98s (9.00s, max_len) rms=3293  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=5]
+14:17:08 INFO    voxlive.session    audio: 40s received, 5 segment(s), diar={'passes': 3, 'windows': 33, 'speakers': 1, 'avg_embed_ms': 1804.3, 'covered_until': 29.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:17:08 INFO    voxlive.speaker    clusters: 45 trusted window(s) (45 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:17:08 INFO    voxlive.speaker    timeline: 46 window(s) -> 1 speaker(s) [1]
+14:17:08 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:15 INFO    voxlive.session    segment 6: 37.98-46.98s (9.00s, max_len) rms=3105  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=6]
+14:17:17 INFO    voxlive.speaker    clusters: 58 trusted window(s) (58 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:17:17 INFO    voxlive.speaker    timeline: 59 window(s) -> 1 speaker(s) [1]
+14:17:17 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:18 INFO    voxlive.session    audio: 50s received, 6 segment(s), diar={'passes': 5, 'windows': 59, 'speakers': 1, 'avg_embed_ms': 1935.0, 'covered_until': 47.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:17:20 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=fd00a861 segment_id=3 event=asr_timeout]
+14:17:20 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:24 INFO    voxlive.session    segment 7: 46.98-55.98s (9.00s, max_len) rms=2830  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=7]
+14:17:24 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=3 event=asr_completed]
+14:17:26 INFO    voxlive.speaker    clusters: 71 trusted window(s) (71 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:17:26 INFO    voxlive.speaker    timeline: 72 window(s) -> 1 speaker(s) [1]
+14:17:26 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:28 INFO    voxlive.session    audio: 60s received, 7 segment(s), diar={'passes': 6, 'windows': 72, 'speakers': 1, 'avg_embed_ms': 2067.5, 'covered_until': 56.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:17:28 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=4 event=asr_completed]
+14:17:29 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=5 event=asr_completed]
+14:17:30 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=7 event=asr_completed]
+14:17:33 INFO    voxlive.session    segment 8: 55.98-64.98s (9.00s, max_len) rms=3507  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=8]
+14:17:35 INFO    voxlive.speaker    clusters: 84 trusted window(s) (84 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:17:35 INFO    voxlive.speaker    timeline: 85 window(s) -> 1 speaker(s) [1]
+14:17:35 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:35 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=6 event=asr_completed]
+14:17:38 INFO    voxlive.session    audio: 70s received, 8 segment(s), diar={'passes': 7, 'windows': 85, 'speakers': 1, 'avg_embed_ms': 2102.4, 'covered_until': 65.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:17:38 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=8 event=asr_completed]
+14:17:42 INFO    voxlive.session    segment 9: 64.98-73.98s (9.00s, max_len) rms=3453  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=9]
+14:17:44 INFO    voxlive.speaker    clusters: 97 trusted window(s) (97 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:17:44 INFO    voxlive.speaker    timeline: 98 window(s) -> 1 speaker(s) [1]
+14:17:44 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:48 INFO    voxlive.session    audio: 80s received, 9 segment(s), diar={'passes': 8, 'windows': 98, 'speakers': 1, 'avg_embed_ms': 2107.9, 'covered_until': 74.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:17:50 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=9 event=asr_completed]
+14:17:51 INFO    voxlive.session    segment 10: 73.98-82.98s (9.00s, max_len) rms=2998  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=10]
+14:17:53 INFO    voxlive.speaker    clusters: 110 trusted window(s) (110 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:17:53 INFO    voxlive.speaker    timeline: 111 window(s) -> 1 speaker(s) [1]
+14:17:53 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:17:56 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=10 event=asr_completed]
+14:17:58 INFO    voxlive.session    audio: 90s received, 10 segment(s), diar={'passes': 9, 'windows': 111, 'speakers': 1, 'avg_embed_ms': 2108.9, 'covered_until': 83.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:18:00 INFO    voxlive.session    segment 11: 82.98-91.98s (9.00s, max_len) rms=3019  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=11]
+14:18:02 INFO    voxlive.speaker    clusters: 123 trusted window(s) (123 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:02 INFO    voxlive.speaker    timeline: 124 window(s) -> 1 speaker(s) [1]
+14:18:02 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:18:05 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=11 event=asr_completed]
+14:18:06 INFO    voxlive.session    segment 12: 91.98-98.07s (6.09s, flush) rms=3552  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861 segment_id=12]
+14:18:06 INFO    voxlive.session    draining 1 in-flight segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:18:07 INFO    voxlive.speaker    clusters: 132 trusted window(s) (132 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:07 INFO    voxlive.speaker    timeline: 134 window(s) -> 1 speaker(s) [1]
+14:18:07 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:18:10 INFO    voxlive.asr.scheduler asr_completed  [session_id=fd00a861 segment_id=12 event=asr_completed]
+14:18:10 INFO    voxlive.speaker    clusters: 133 trusted window(s) (133 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:10 INFO    voxlive.session    session done: {'passes': 12, 'windows': 135, 'speakers': 1, 'avg_embed_ms': 1947.9, 'covered_until': 98.19}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:18:10 INFO    voxlive.ws         client disconnected after 12 segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:18:10 INFO    voxlive.sessions   session_closed (duration_sec=109.0, segments=12, active=0)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=fd00a861]
+14:18:10 INFO    uvicorn.error      connection closed
+14:18:25 INFO    uvicorn.access     127.0.0.1:12685 - "GET /auth/me HTTP/1.1" 200
+14:18:25 INFO    uvicorn.access     127.0.0.1:12685 - "GET /auth/me HTTP/1.1" 200
+14:18:30 INFO    uvicorn.error      127.0.0.1:1719 - "WebSocket /ws/transcribe?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ2b3hsaXZlIiwidHlwIjoiYWNjZXNzIiwic3ViIjoidXNyXzE3ODY5NTM1NTA0MTlfNjY3ZDE0ZWYiLCJvcmciOiJvcmdfMTc4Njk1MzU1MDQxOV83MzZkMDA4NCIsInJvbGUiOiJvd25lciIsImVtYWlsIjoibndhdGNoMTE3QGdtYWlsLmNvbSIsImlhdCI6MTc4Njk1NjUwNSwiZXhwIjoxNzg2OTk5NzA1fQ.Taso6SeClFUi1BExuAIZ40AsoQnwncgVWutI7SznHi8" [accepted]
+14:18:30 INFO    uvicorn.error      connection open
+14:18:30 INFO    voxlive.vad        VADSegmenter ready: rate=16000 frame=30ms aggr=2 silence=450ms soft_max=3500ms max=9000ms min=300ms preroll=250ms
+14:18:30 INFO    voxlive.sessions   session_started (expected_speakers=2, active=1, org_active=1)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:18:40 INFO    voxlive.session    segment 1: 1.26-5.19s (3.93s, soft_gap) rms=3586  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=1]
+14:18:40 INFO    voxlive.speaker    clusters: 3 trusted window(s) (3 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:40 INFO    voxlive.speaker    timeline: 4 window(s) -> 1 speaker(s) [1]
+14:18:40 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:18:43 INFO    voxlive.speaker    clusters: 6 trusted window(s) (6 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:43 INFO    voxlive.speaker    timeline: 21 window(s) -> 1 speaker(s) [1]
+14:18:44 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=1 event=asr_completed]
+14:18:44 INFO    voxlive.session    audio: 10s received, 1 segment(s), diar={'passes': 26, 'windows': 31, 'speakers': 1, 'avg_embed_ms': 177.8, 'covered_until': 8.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:18:45 INFO    voxlive.session    segment 2: 5.28-10.23s (4.95s, soft_gap) rms=3379  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=2]
+14:18:45 INFO    voxlive.speaker    timeline: 36 window(s) -> 1 speaker(s) [1]
+14:18:45 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:18:49 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=2 event=asr_completed]
+14:18:50 INFO    voxlive.session    segment 3: 10.23-15.45s (5.22s, soft_gap) rms=3605  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=3]
+14:18:51 INFO    voxlive.speaker    clusters: 13 trusted window(s) (13 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:51 INFO    voxlive.speaker    timeline: 77 window(s) -> 1 speaker(s) [1]
+14:18:51 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:18:54 INFO    voxlive.session    audio: 20s received, 3 segment(s), diar={'passes': 90, 'windows': 103, 'speakers': 1, 'avg_embed_ms': 156.7, 'covered_until': 15.5}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:18:57 INFO    voxlive.session    segment 4: 15.78-22.83s (7.05s, soft_gap) rms=3801  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=4]
+14:18:59 INFO    voxlive.speaker    clusters: 21 trusted window(s) (21 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:18:59 INFO    voxlive.speaker    timeline: 134 window(s) -> 1 speaker(s) [1]
+14:18:59 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:03 INFO    voxlive.session    segment 5: 22.83-28.38s (5.55s, soft_gap) rms=3698  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=5]
+14:19:04 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:04 INFO    voxlive.session    audio: 30s received, 5 segment(s), diar={'passes': 133, 'windows': 154, 'speakers': 1, 'avg_embed_ms': 173.9, 'covered_until': 23.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:19:07 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=4 event=asr_completed]
+14:19:08 INFO    voxlive.session    segment 6: 28.38-33.96s (5.58s, soft_gap) rms=3455  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=6]
+14:19:11 INFO    voxlive.speaker    clusters: 35 trusted window(s) (35 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:11 INFO    voxlive.speaker    timeline: 184 window(s) -> 1 speaker(s) [1]
+14:19:11 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:11 WARNING voxlive.asr.scheduler ASR rate limited (attempt 1/3)  [session_id=eb930ea7 segment_id=5 event=asr_rate_limited]
+14:19:13 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=3 event=asr_completed]
+14:19:14 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:14 INFO    voxlive.session    segment 7: 34.05-39.69s (5.64s, soft_gap) rms=3415  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=7]
+14:19:14 INFO    voxlive.session    audio: 40s received, 7 segment(s), diar={'passes': 173, 'windows': 207, 'speakers': 1, 'avg_embed_ms': 185.1, 'covered_until': 34.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:19:15 INFO    voxlive.speaker    clusters: 41 trusted window(s) (41 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:15 INFO    voxlive.speaker    timeline: 214 window(s) -> 1 speaker(s) [1]
+14:19:16 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:17 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=5 event=asr_completed]
+14:19:19 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=6 event=asr_completed]
+14:19:20 INFO    voxlive.session    segment 8: 39.69-45.90s (6.21s, soft_gap) rms=3581  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=8]
+14:19:22 INFO    voxlive.speaker    clusters: 48 trusted window(s) (48 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:22 INFO    voxlive.speaker    timeline: 252 window(s) -> 1 speaker(s) [1]
+14:19:22 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:22 INFO    voxlive.speaker    timeline: 256 window(s) -> 1 speaker(s) [1]
+14:19:25 INFO    voxlive.session    audio: 50s received, 8 segment(s), diar={'passes': 221, 'windows': 269, 'speakers': 1, 'avg_embed_ms': 186.7, 'covered_until': 47.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:19:28 INFO    voxlive.session    segment 9: 45.90-54.00s (8.10s, soft_gap) rms=3331  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=9]
+14:19:29 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:33 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=9 event=asr_completed]
+14:19:34 INFO    voxlive.session    segment 10: 54.00-59.94s (5.94s, soft_gap) rms=3763  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=10]
+14:19:35 INFO    voxlive.session    audio: 60s received, 10 segment(s), diar={'passes': 281, 'windows': 329, 'speakers': 1, 'avg_embed_ms': 176.6, 'covered_until': 47.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:19:37 INFO    voxlive.speaker    clusters: 63 trusted window(s) (63 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:37 INFO    voxlive.speaker    timeline: 345 window(s) -> 1 speaker(s) [1]
+14:19:37 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:41 INFO    voxlive.session    segment 11: 59.94-66.12s (6.18s, soft_gap) rms=3283  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=11]
+14:19:41 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=10 event=asr_completed]
+14:19:42 INFO    voxlive.speaker    clusters: 69 trusted window(s) (69 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:42 INFO    voxlive.speaker    timeline: 375 window(s) -> 1 speaker(s) [1]
+14:19:42 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:45 INFO    voxlive.session    audio: 70s received, 11 segment(s), diar={'passes': 319, 'windows': 389, 'speakers': 1, 'avg_embed_ms': 183.1, 'covered_until': 66.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:19:46 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=eb930ea7 segment_id=7 event=asr_timeout]
+14:19:46 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:46 INFO    voxlive.session    segment 12: 66.12-72.03s (5.91s, soft_gap) rms=3795  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=12]
+14:19:48 INFO    voxlive.speaker    clusters: 75 trusted window(s) (75 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:48 INFO    voxlive.speaker    timeline: 406 window(s) -> 1 speaker(s) [1]
+14:19:48 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:49 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=7 event=asr_completed]
+14:19:50 INFO    voxlive.session    segment 13: 72.03-75.90s (3.87s, soft_gap) rms=3359  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=13]
+14:19:51 INFO    voxlive.speaker    clusters: 78 trusted window(s) (78 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:51 INFO    voxlive.speaker    timeline: 423 window(s) -> 1 speaker(s) [1]
+14:19:51 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:52 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=eb930ea7 segment_id=8 event=asr_timeout]
+14:19:53 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:54 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=11 event=asr_completed]
+14:19:54 INFO    voxlive.session    segment 14: 76.08-79.98s (3.90s, soft_gap) rms=3774  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=14]
+14:19:55 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=12 event=asr_completed]
+14:19:55 INFO    voxlive.session    audio: 80s received, 14 segment(s), diar={'passes': 359, 'windows': 439, 'speakers': 1, 'avg_embed_ms': 185.7, 'covered_until': 76.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:19:55 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=13 event=asr_completed]
+14:19:56 INFO    voxlive.speaker    clusters: 82 trusted window(s) (82 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:56 INFO    voxlive.speaker    timeline: 444 window(s) -> 1 speaker(s) [1]
+14:19:56 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:19:56 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=8 event=asr_completed]
+14:19:56 INFO    voxlive.speaker    clusters: 85 trusted window(s) (85 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:57 INFO    voxlive.speaker    clusters: 88 trusted window(s) (88 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:58 INFO    voxlive.speaker    clusters: 91 trusted window(s) (91 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:59 INFO    voxlive.speaker    clusters: 94 trusted window(s) (94 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:19:59 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=14 event=asr_completed]
+14:19:59 INFO    voxlive.speaker    clusters: 97 trusted window(s) (97 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:20:00 INFO    voxlive.speaker    clusters: 100 trusted window(s) (100 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:20:01 INFO    voxlive.speaker    clusters: 103 trusted window(s) (103 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:20:02 INFO    voxlive.speaker    clusters: 106 trusted window(s) (106 sampled) -> 1 speaker(s) (silhouette=0.000, closest centroids=1.000)
+14:20:05 INFO    voxlive.session    audio: 90s received, 14 segment(s), diar={'passes': 384, 'windows': 468, 'speakers': 1, 'avg_embed_ms': 188.3, 'covered_until': 80.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:20:05 INFO    voxlive.speaker    clusters: 109 trusted window(s) (109 sampled) -> 2 speaker(s) (silhouette=0.588, closest centroids=0.799)
+14:20:05 INFO    voxlive.speaker    timeline: 472 window(s) -> 2 speaker(s) [1, 2]
+14:20:06 INFO    voxlive.speaker    clusters: 111 trusted window(s) (111 sampled) -> 2 speaker(s) (silhouette=0.610, closest centroids=0.828)
+14:20:06 INFO    voxlive.speaker    timeline: 475 window(s) -> 2 speaker(s) [1, 2]
+14:20:10 INFO    voxlive.session    segment 15: 86.07-95.07s (9.00s, max_len) rms=3552  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=15]
+14:20:11 INFO    voxlive.speaker    clusters: 117 trusted window(s) (117 sampled) -> 2 speaker(s) (silhouette=0.614, closest centroids=0.829)
+14:20:11 INFO    voxlive.speaker    timeline: 482 window(s) -> 2 speaker(s) [1, 2]
+14:20:11 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:15 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=15 event=asr_completed]
+14:20:15 INFO    voxlive.session    audio: 100s received, 15 segment(s), diar={'passes': 387, 'windows': 482, 'speakers': 2, 'avg_embed_ms': 193.5, 'covered_until': 95.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:20:19 INFO    voxlive.session    segment 16: 95.07-104.07s (9.00s, max_len) rms=3682  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=16]
+14:20:21 INFO    voxlive.speaker    clusters: 130 trusted window(s) (130 sampled) -> 2 speaker(s) (silhouette=0.620, closest centroids=0.853)
+14:20:21 INFO    voxlive.speaker    timeline: 495 window(s) -> 2 speaker(s) [1, 2]
+14:20:21 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:25 INFO    voxlive.session    audio: 110s received, 16 segment(s), diar={'passes': 388, 'windows': 495, 'speakers': 2, 'avg_embed_ms': 198.7, 'covered_until': 104.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:20:28 INFO    voxlive.session    segment 17: 104.07-113.07s (9.00s, max_len) rms=3852  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=17]
+14:20:30 INFO    voxlive.speaker    clusters: 143 trusted window(s) (143 sampled) -> 2 speaker(s) (silhouette=0.620, closest centroids=0.854)
+14:20:30 INFO    voxlive.speaker    timeline: 508 window(s) -> 2 speaker(s) [1, 2]
+14:20:30 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:35 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=17 event=asr_completed]
+14:20:35 INFO    voxlive.session    audio: 120s received, 17 segment(s), diar={'passes': 389, 'windows': 508, 'speakers': 2, 'avg_embed_ms': 203.8, 'covered_until': 113.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:20:37 INFO    voxlive.session    segment 18: 113.07-122.07s (9.00s, max_len) rms=3476  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=18]
+14:20:39 INFO    voxlive.speaker    clusters: 156 trusted window(s) (156 sampled) -> 2 speaker(s) (silhouette=0.618, closest centroids=0.848)
+14:20:39 INFO    voxlive.speaker    timeline: 521 window(s) -> 2 speaker(s) [1, 2]
+14:20:39 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:42 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=18 event=asr_completed]
+14:20:45 INFO    voxlive.session    audio: 130s received, 18 segment(s), diar={'passes': 390, 'windows': 521, 'speakers': 2, 'avg_embed_ms': 208.8, 'covered_until': 122.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:20:46 INFO    voxlive.session    segment 19: 122.07-131.07s (9.00s, max_len) rms=3358  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=19]
+14:20:48 INFO    voxlive.speaker    clusters: 169 trusted window(s) (169 sampled) -> 2 speaker(s) (silhouette=0.618, closest centroids=0.850)
+14:20:48 INFO    voxlive.speaker    timeline: 534 window(s) -> 2 speaker(s) [1, 2]
+14:20:48 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:49 INFO    voxlive.session    segment 20: 131.07-134.88s (3.81s, soft_gap) rms=2955  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=20]
+14:20:51 INFO    voxlive.speaker    clusters: 175 trusted window(s) (175 sampled) -> 2 speaker(s) (silhouette=0.620, closest centroids=0.852)
+14:20:51 INFO    voxlive.speaker    timeline: 541 window(s) -> 2 speaker(s) [1, 2]
+14:20:51 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:51 WARNING voxlive.asr.scheduler ASR timeout after 30s (attempt 1/3)  [session_id=eb930ea7 segment_id=16 event=asr_timeout]
+14:20:51 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:20:52 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=19 event=asr_completed]
+14:20:55 INFO    voxlive.session    audio: 140s received, 20 segment(s), diar={'passes': 392, 'windows': 541, 'speakers': 2, 'avg_embed_ms': 216.9, 'covered_until': 135.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:20:56 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=16 event=asr_completed]
+14:20:57 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=20 event=asr_completed]
+14:20:58 INFO    voxlive.session    segment 21: 134.88-143.88s (9.00s, max_len) rms=3426  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=21]
+14:21:01 INFO    voxlive.speaker    clusters: 188 trusted window(s) (188 sampled) -> 2 speaker(s) (silhouette=0.621, closest centroids=0.857)
+14:21:01 INFO    voxlive.speaker    timeline: 554 window(s) -> 2 speaker(s) [1, 2]
+14:21:01 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:05 INFO    voxlive.session    audio: 150s received, 21 segment(s), diar={'passes': 393, 'windows': 554, 'speakers': 2, 'avg_embed_ms': 222.3, 'covered_until': 144.0}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:06 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=21 event=asr_completed]
+14:21:06 INFO    voxlive.session    segment 22: 143.88-151.47s (7.59s, soft_gap) rms=3320  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=22]
+14:21:08 INFO    voxlive.speaker    clusters: 199 trusted window(s) (199 sampled) -> 2 speaker(s) (silhouette=0.622, closest centroids=0.858)
+14:21:08 INFO    voxlive.speaker    timeline: 566 window(s) -> 2 speaker(s) [1, 2]
+14:21:08 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:15 INFO    voxlive.session    audio: 160s received, 22 segment(s), diar={'passes': 394, 'windows': 566, 'speakers': 2, 'avg_embed_ms': 226.9, 'covered_until': 151.5}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:15 INFO    voxlive.session    segment 23: 151.47-160.47s (9.00s, max_len) rms=3388  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=23]
+14:21:17 INFO    voxlive.speaker    clusters: 212 trusted window(s) (212 sampled) -> 2 speaker(s) (silhouette=0.614, closest centroids=0.860)
+14:21:17 INFO    voxlive.speaker    timeline: 579 window(s) -> 2 speaker(s) [1, 2]
+14:21:17 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:19 INFO    voxlive.speaker    clusters: 217 trusted window(s) (217 sampled) -> 2 speaker(s) (silhouette=0.612, closest centroids=0.862)
+14:21:19 INFO    voxlive.speaker    timeline: 585 window(s) -> 2 speaker(s) [1, 2]
+14:21:22 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=23 event=asr_completed]
+14:21:23 INFO    voxlive.session    segment 24: 160.47-168.18s (7.71s, soft_gap) rms=3118  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=24]
+14:21:24 INFO    voxlive.speaker    clusters: 224 trusted window(s) (224 sampled) -> 2 speaker(s) (silhouette=0.609, closest centroids=0.861)
+14:21:24 INFO    voxlive.speaker    timeline: 592 window(s) -> 2 speaker(s) [1, 2]
+14:21:24 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:25 INFO    voxlive.session    audio: 170s received, 24 segment(s), diar={'passes': 397, 'windows': 592, 'speakers': 2, 'avg_embed_ms': 236.6, 'covered_until': 168.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:26 INFO    voxlive.session    segment 25: 168.18-171.75s (3.57s, soft_gap) rms=3505  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=25]
+14:21:27 INFO    voxlive.speaker    clusters: 230 trusted window(s) (230 sampled) -> 2 speaker(s) (silhouette=0.605, closest centroids=0.860)
+14:21:27 INFO    voxlive.speaker    timeline: 598 window(s) -> 2 speaker(s) [1, 2]
+14:21:27 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:28 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=24 event=asr_completed]
+14:21:31 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=25 event=asr_completed]
+14:21:34 INFO    voxlive.session    segment 26: 171.75-179.55s (7.80s, soft_gap) rms=929  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=26]
+14:21:35 INFO    voxlive.session    audio: 180s received, 26 segment(s), diar={'passes': 398, 'windows': 598, 'speakers': 2, 'avg_embed_ms': 238.5, 'covered_until': 171.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:36 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=22 event=asr_completed]
+14:21:36 INFO    voxlive.speaker    clusters: 241 trusted window(s) (241 sampled) -> 2 speaker(s) (silhouette=0.365, closest centroids=0.964)
+14:21:36 INFO    voxlive.speaker    timeline: 610 window(s) -> 2 speaker(s) [1, 2]
+14:21:37 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:37 INFO    voxlive.speaker    clusters: 244 trusted window(s) (244 sampled) -> 2 speaker(s) (silhouette=0.372, closest centroids=0.967)
+14:21:38 INFO    voxlive.speaker    clusters: 247 trusted window(s) (247 sampled) -> 2 speaker(s) (silhouette=0.379, closest centroids=0.969)
+14:21:39 INFO    voxlive.speaker    clusters: 250 trusted window(s) (250 sampled) -> 2 speaker(s) (silhouette=0.386, closest centroids=0.970)
+14:21:39 INFO    voxlive.speaker    clusters: 253 trusted window(s) (253 sampled) -> 2 speaker(s) (silhouette=0.392, closest centroids=0.971)
+14:21:40 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=26 event=asr_completed]
+14:21:44 INFO    voxlive.session    segment 27: 184.02-189.24s (5.22s, soft_gap) rms=4501  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=27]
+14:21:45 INFO    voxlive.speaker    clusters: 258 trusted window(s) (258 sampled) -> 2 speaker(s) (silhouette=0.380, closest centroids=0.968)
+14:21:45 INFO    voxlive.speaker    timeline: 627 window(s) -> 2 speaker(s) [1, 2]
+14:21:45 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:45 INFO    voxlive.session    audio: 190s received, 27 segment(s), diar={'passes': 412, 'windows': 627, 'speakers': 2, 'avg_embed_ms': 242.8, 'covered_until': 189.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:49 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=27 event=asr_completed]
+14:21:53 INFO    voxlive.session    segment 28: 189.24-198.24s (9.00s, max_len) rms=3782  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=28]
+14:21:55 INFO    voxlive.session    audio: 200s received, 28 segment(s), diar={'passes': 412, 'windows': 627, 'speakers': 2, 'avg_embed_ms': 242.8, 'covered_until': 189.25}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:55 INFO    voxlive.speaker    clusters: 271 trusted window(s) (271 sampled) -> 2 speaker(s) (silhouette=0.351, closest centroids=0.962)
+14:21:55 INFO    voxlive.speaker    timeline: 640 window(s) -> 2 speaker(s) [1, 2]
+14:21:55 INFO    voxlive.session    segment split into 3 turn(s) at 191.50s, 196.00s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:21:55 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:55 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:55 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:56 INFO    voxlive.session    segment 29: 198.24-201.75s (3.51s, soft_gap) rms=3969  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=29]
+14:21:57 INFO    voxlive.speaker    clusters: 276 trusted window(s) (276 sampled) -> 2 speaker(s) (silhouette=0.344, closest centroids=0.961)
+14:21:57 INFO    voxlive.speaker    timeline: 646 window(s) -> 2 speaker(s) [1, 2]
+14:21:57 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:21:58 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=28 event=asr_completed]
+14:21:59 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=28 event=asr_completed]
+14:22:00 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=28 event=asr_completed]
+14:22:00 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=29 event=asr_completed]
+14:22:02 INFO    voxlive.session    segment 30: 201.75-207.60s (5.85s, soft_gap) rms=3707  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=30]
+14:22:03 INFO    voxlive.speaker    clusters: 285 trusted window(s) (285 sampled) -> 2 speaker(s) (silhouette=0.328, closest centroids=0.959)
+14:22:03 INFO    voxlive.speaker    timeline: 655 window(s) -> 2 speaker(s) [1, 2]
+14:22:03 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:05 INFO    voxlive.session    audio: 210s received, 30 segment(s), diar={'passes': 431, 'windows': 671, 'speakers': 2, 'avg_embed_ms': 243.7, 'covered_until': 207.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:06 WARNING voxlive.asr.scheduler ASR rate limited (attempt 1/3)  [session_id=eb930ea7 segment_id=30 event=asr_rate_limited]
+14:22:08 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:11 INFO    voxlive.session    segment 31: 207.60-215.91s (8.31s, soft_gap) rms=4306  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=31]
+14:22:11 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:13 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=30 event=asr_completed]
+14:22:15 INFO    voxlive.session    audio: 220s received, 31 segment(s), diar={'passes': 511, 'windows': 751, 'speakers': 2, 'avg_embed_ms': 218.1, 'covered_until': 207.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:15 INFO    voxlive.session    segment 32: 215.91-220.50s (4.59s, soft_gap) rms=4124  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=32]
+14:22:17 INFO    voxlive.speaker    clusters: 300 trusted window(s) (300 sampled) -> 2 speaker(s) (silhouette=0.308, closest centroids=0.956)
+14:22:17 INFO    voxlive.speaker    timeline: 769 window(s) -> 2 speaker(s) [1, 2]
+14:22:17 INFO    voxlive.session    segment split into 2 turn(s) at 219.50s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:17 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:17 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:18 INFO    voxlive.speaker    clusters: 303 trusted window(s) (303 sampled) -> 2 speaker(s) (silhouette=0.303, closest centroids=0.954)
+14:22:18 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=31 event=asr_completed]
+14:22:18 INFO    voxlive.speaker    timeline: 773 window(s) -> 2 speaker(s) [1, 2]
+14:22:20 INFO    voxlive.session    segment 33: 220.50-225.75s (5.25s, soft_gap) rms=3813  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=33]
+14:22:20 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=32 event=asr_completed]
+14:22:21 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=32 event=asr_completed]
+14:22:21 INFO    voxlive.speaker    clusters: 308 trusted window(s) (308 sampled) -> 2 speaker(s) (silhouette=0.296, closest centroids=0.951)
+14:22:21 INFO    voxlive.speaker    timeline: 779 window(s) -> 2 speaker(s) [1, 2]
+14:22:21 INFO    voxlive.session    segment split into 2 turn(s) at 224.75s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:21 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:21 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:22 INFO    voxlive.speaker    clusters: 310 trusted window(s) (310 sampled) -> 2 speaker(s) (silhouette=0.293, closest centroids=0.950)
+14:22:22 INFO    voxlive.speaker    timeline: 782 window(s) -> 2 speaker(s) [1, 2]
+14:22:25 INFO    voxlive.session    audio: 230s received, 33 segment(s), diar={'passes': 516, 'windows': 782, 'speakers': 2, 'avg_embed_ms': 222.1, 'covered_until': 226.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:25 INFO    voxlive.speaker    clusters: 315 trusted window(s) (315 sampled) -> 2 speaker(s) (silhouette=0.288, closest centroids=0.949)
+14:22:25 INFO    voxlive.speaker    timeline: 787 window(s) -> 2 speaker(s) [1, 2]
+14:22:26 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=33 event=asr_completed]
+14:22:27 INFO    voxlive.speaker    clusters: 318 trusted window(s) (318 sampled) -> 2 speaker(s) (silhouette=0.286, closest centroids=0.949)
+14:22:27 INFO    voxlive.speaker    timeline: 791 window(s) -> 2 speaker(s) [1, 2]
+14:22:28 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=33 event=asr_completed]
+14:22:29 INFO    voxlive.session    segment 34: 225.75-234.75s (9.00s, max_len) rms=4124  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=34]
+14:22:31 INFO    voxlive.speaker    clusters: 323 trusted window(s) (323 sampled) -> 2 speaker(s) (silhouette=0.280, closest centroids=0.948)
+14:22:31 INFO    voxlive.speaker    timeline: 797 window(s) -> 2 speaker(s) [1, 2]
+14:22:31 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:33 INFO    voxlive.session    segment 35: 234.75-238.38s (3.63s, soft_gap) rms=3773  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=35]
+14:22:34 INFO    voxlive.speaker    clusters: 329 trusted window(s) (329 sampled) -> 2 speaker(s) (silhouette=0.276, closest centroids=0.947)
+14:22:34 INFO    voxlive.speaker    timeline: 803 window(s) -> 2 speaker(s) [1, 2]
+14:22:34 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:35 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=34 event=asr_completed]
+14:22:35 INFO    voxlive.session    audio: 240s received, 35 segment(s), diar={'passes': 520, 'windows': 803, 'speakers': 2, 'avg_embed_ms': 227.5, 'covered_until': 238.5}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:35 INFO    voxlive.speaker    clusters: 332 trusted window(s) (332 sampled) -> 2 speaker(s) (silhouette=0.273, closest centroids=0.946)
+14:22:36 INFO    voxlive.speaker    timeline: 807 window(s) -> 2 speaker(s) [1, 2]
+14:22:42 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=35 event=asr_completed]
+14:22:42 INFO    voxlive.session    segment 36: 238.38-247.38s (9.00s, max_len) rms=3588  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=36]
+14:22:42 INFO    voxlive.speaker    clusters: 340 trusted window(s) (340 sampled) -> 2 speaker(s) (silhouette=0.256, closest centroids=0.910)
+14:22:42 INFO    voxlive.speaker    timeline: 816 window(s) -> 2 speaker(s) [1, 2]
+14:22:43 INFO    voxlive.session    segment split into 2 turn(s) at 240.00s  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:43 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:43 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:45 INFO    voxlive.session    segment 37: 247.38-249.90s (2.52s, silence) rms=2945  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 segment_id=37]
+14:22:45 INFO    voxlive.session    audio: 250s received, 37 segment(s), diar={'passes': 522, 'windows': 816, 'speakers': 2, 'avg_embed_ms': 231.1, 'covered_until': 245.75}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:45 INFO    voxlive.speaker    clusters: 346 trusted window(s) (346 sampled) -> 2 speaker(s) (silhouette=0.245, closest centroids=0.886)
+14:22:45 INFO    voxlive.speaker    timeline: 822 window(s) -> 2 speaker(s) [1, 2]
+14:22:46 INFO    voxlive.speaker    timeline: 823 window(s) -> 2 speaker(s) [1, 2]
+14:22:46 INFO    google_genai.models AFC is enabled with max remote calls: 10.
+14:22:46 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=36 event=asr_completed]
+14:22:46 INFO    voxlive.speaker    clusters: 349 trusted window(s) (349 sampled) -> 2 speaker(s) (silhouette=0.241, closest centroids=0.884)
+14:22:47 INFO    voxlive.speaker    clusters: 352 trusted window(s) (352 sampled) -> 2 speaker(s) (silhouette=0.238, closest centroids=0.882)
+14:22:47 INFO    voxlive.speaker    timeline: 828 window(s) -> 2 speaker(s) [1, 2]
+14:22:48 INFO    voxlive.session    draining 2 in-flight segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:48 INFO    voxlive.speaker    clusters: 355 trusted window(s) (355 sampled) -> 2 speaker(s) (silhouette=0.243, closest centroids=0.933)
+14:22:48 INFO    voxlive.speaker    timeline: 831 window(s) -> 2 speaker(s) [1, 2]
+14:22:50 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=37 event=asr_completed]
+14:22:50 INFO    voxlive.asr.scheduler asr_completed  [session_id=eb930ea7 segment_id=36 event=asr_completed]
+14:22:50 INFO    voxlive.speaker    clusters: 357 trusted window(s) (357 sampled) -> 2 speaker(s) (silhouette=0.241, closest centroids=0.932)
+14:22:50 WARNING voxlive.session    2 paragraph(s) (12.2s) contain a speaker change that could not be split: the timeline did not cover them when they were cut. Shorten segments (SILENCE_MS / SOFT_MAX_SEGMENT_MS / MAX_SEGMENT_MS) if this stays high.  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7 event=diarization_unsplit]
+14:22:50 INFO    voxlive.session    session done: {'passes': 534, 'windows': 833, 'speakers': 2, 'avg_embed_ms': 231.7, 'covered_until': 249.5}  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:50 INFO    voxlive.ws         client disconnected after 37 segment(s)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:50 INFO    voxlive.sessions   session_closed (duration_sec=260.4, segments=37, active=0)  [tenant_id=org_1786953550419_736d0084 user_id=usr_1786953550419_667d14ef session_id=eb930ea7]
+14:22:50 INFO    uvicorn.error      connection closed

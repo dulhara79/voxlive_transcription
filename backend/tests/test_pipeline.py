@@ -12,9 +12,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
 
-import app.speaker_engine as se
-import app.embedder as emb_mod
-from app.transcript import TranscriptStore
+import app.diarization.speaker_engine as se
+import app.diarization.embedder as emb_mod
+from app.session.transcript import TranscriptStore
 from test_speaker_engine import voice, utterance
 
 SR = 16000
@@ -89,7 +89,7 @@ def synth_audio(total_sec=17.5):
 
 async def main():
     se.speech_regions = fake_speech_regions
-    import app.diarization_service as ds
+    import app.diarization.service as ds
     ds.speech_regions = fake_speech_regions
     ds.Embedder = FakeEmbedder
 

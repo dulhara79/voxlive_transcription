@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import numpy as np
 from scipy.spatial.distance import cdist
 
-from app.speaker_engine import SpeakerEngine, Window, l2norm
+from app.diarization.speaker_engine import SpeakerEngine, Window, l2norm
 from test_speaker_engine import voice, utterance
 
 

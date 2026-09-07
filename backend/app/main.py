@@ -1,85 +1,134 @@
 """
-VoxLive backend — Gemini ASR + background speaker diarization (v10).
+VoxLive backend — application assembly only.
 
-THE SHAPE OF THE CHANGE
------------------------
-v7 ran, per segment, strictly in order:
+WHAT THIS FILE IS FOR
+---------------------
+Creating the FastAPI app, running start-up/shutdown, installing middleware,
+and registering routes. Nothing else.
 
-    VAD close -> diarize (1-4 s, blocking) -> ASR (1-3 s) -> emit
+Everything that used to live here now has an owner:
 
-Diarization sat on the critical path even though it answers a question that
-has nothing to do with the words. With a 6-second soft segment cap on top,
-the transcript ran 8-13 seconds behind the room.
+    api/routes_ws.py        "How do I communicate with the browser?"
+    api/routes_health.py    "Is this process alive / should it take traffic?"
+    session/state.py        "What is happening in this one session?"
+    session/manager.py      "Which sessions exist?"
+    asr/scheduler.py        "How much ASR work may execute?"
+    diarization/scheduler.py"How much diarization work may execute?"
+    observability/logging.py"How do I record operational events?"
 
-v10 runs the two independently and joins them on the audio clock:
+START-UP ORDER MATTERS
+----------------------
+    process starts
+      -> logging configured        (so every later line is structured)
+      -> configuration profile selected from APP_ENV
+      -> schedulers started        (capacity exists before any session can)
+      -> ASR provider constructed
+      -> diarization model loaded and warmed
+      -> app.state.warm = True
+      -> /ready returns 200
+      -> ALB begins sending traffic
 
-    VAD close ──► ASR ──────────────┐
-                                    ├──► text + speaker ──► client
-    raw audio ──► DiarizationService┘
-                  (background pass every ~1.5 s)
+`/ready` stays 503 for the whole warm-up, so an ECS task cannot receive a user
+while WeSpeaker is still loading.
 
-A diarization pass costs ~150-400 ms because every window of the pass is
-embedded in ONE batch; a Gemini call costs 1-3 s. So the speaker timeline is
-normally ready before the text is, and joining them is free. When it isn't,
-the segment waits a bounded ~900 ms and otherwise ships with a best-effort
-label that the next pass corrects via `refresh`.
+Run (development):
+    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-Nothing here decides a speaker. That is entirely SpeakerEngine's job, run over
-the whole session, every pass, from scratch — so there is no greedy decision
-to regret and no online centroid to poison.
-
-Run:
-    uvicorn app.main:app --host 0.0.0.0 --port 8000
+Run (production — never --reload; it watches the filesystem and restarts the
+process, dropping every live WebSocket with it):
+    APP_ENV=production uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
 
-import asyncio
 import logging
 import os
-import traceback
-from collections import deque
 from contextlib import asynccontextmanager
 
-import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .audio import Segment, VADSegmenter
-from .config import settings
-from .diarizer_factory import build_diarizer, resolve_backend, warmup_backend
-from .postprocess import PostProcessor
-from .schemas import error_msg, refresh_msg, speakers_msg, status_msg
-from .transcript import TranscriptStore
+from .api.routes_auth import router as auth_router
+from .api.routes_health import router as health_router
+from .api.routes_ws import router as ws_router
+from .asr.postprocess import PostProcessor
+from .asr.scheduler import ASRScheduler
+from .auth.principal import build_resolver
+from .config import APP_ENV, settings
+from .diarization import scheduler as diar_scheduler
+from .diarization.factory import warmup_backend
+from .observability.logging import configure_logging
+from .session.manager import SessionManager
+from .tenant.quotas import AdmissionController, CapacityManager, QuotaManager
+from .tenant.repository import InMemoryTenantRepository, TenantRepository
+from .tenant.seed import seed_development_tenants
+from .tenant.sqlite_repository import SqliteTenantRepository
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
 log = logging.getLogger("voxlive")
 
-ASR_MAX_RETRIES = 3
-ASR_CONCURRENCY = int(os.getenv("ASR_CONCURRENCY", "6"))
 
-# Padding around a speaker-turn cut so word onsets/offsets aren't clipped.
-CHUNK_PAD_PRE_S = 0.10
-CHUNK_PAD_POST_S = 0.15
-
-state: dict = {}
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
-def _rms(pcm: bytes) -> float:
-    if not pcm:
-        return 0.0
-    arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    return float(np.sqrt(np.mean(arr * arr)))
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
-def _is_rate_limit(err) -> bool:
-    s = str(err)
-    return "429" in s or "RESOURCE_EXHAUSTED" in s
+def build_tenant_repository() -> TenantRepository:
+    """Choose where organizations and users live, from DATABASE_URL.
+
+        DATABASE_URL=sqlite:///./voxlive.db   file-backed  (development default)
+        DATABASE_URL=memory                   dictionaries (tests only)
+
+    The default is a FILE, not memory. That is the whole point of this
+    function: with an in-memory repository, every backend restart discarded
+    every registered account, so local testing meant signing up again after
+    each `uvicorn --reload` cycle.
+
+    `memory` stays available and is what the test suite selects, because tests
+    want a repository that starts empty and leaves nothing behind on disk.
+
+    A `postgresql://` URL is REJECTED rather than quietly downgraded: a
+    SqlTenantRepository does not exist yet, and silently serving a production
+    URL from a local SQLite file is the kind of thing that is only discovered
+    after data has been written to the wrong place.
+    """
+    url = os.getenv("DATABASE_URL", "").strip()
+
+    if url.lower() in ("memory", "memory://", "sqlite:///:memory:"):
+        log.info("tenant storage: in-memory (nothing survives a restart)")
+        return InMemoryTenantRepository()
+
+    if not url:
+        url = "sqlite:///./voxlive.db"
+
+    lowered = url.lower()
+    if lowered.startswith("sqlite:"):
+        # sqlite:///./voxlive.db  ->  ./voxlive.db
+        path = url.split("://", 1)[1] if "://" in url else url
+        path = path.lstrip("/") if path.startswith("///") else path.lstrip("/")
+        return SqliteTenantRepository(path or "voxlive.db")
+
+    raise RuntimeError(
+        f"DATABASE_URL={url!r} is not supported. This build implements "
+        "'sqlite:///<path>' and 'memory'. PostgreSQL needs a "
+        "SqlTenantRepository, which does not exist yet — refusing to start "
+        "rather than writing your data somewhere you did not ask for."
+    )
 
 
 def build_provider():
-    from .providers.gemini_provider import GeminiProvider
+    """Construct the configured ASR provider once, at start-up.
+
+    Building a client per request re-resolves credentials and re-opens the
+    connection pool, which shows up directly in tail latency.
+    """
+    from .asr.gemini_provider import GeminiProvider
 
     log.info("ASR provider: Gemini (%s)", settings.gemini_model)
     return GeminiProvider(
@@ -90,389 +139,88 @@ def build_provider():
         project=settings.google_cloud_project,
         location=settings.google_cloud_location,
         max_words_per_sec=settings.max_words_per_sec,
+        max_chars_per_sec=settings.max_chars_per_sec,
+        thinking_budget=settings.gemini_thinking_budget,
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    state["provider"] = build_provider()
-    state["postproc"] = PostProcessor()
+    configure_logging(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        json_format=os.getenv("LOG_JSON", "true").lower() in ("1", "true", "yes", "on"),
+    )
+    log.info("starting VoxLive (profile=%s)", APP_ENV)
+
+    app.state.warm = False
+    app.state.sessions = SessionManager()
+    app.state.provider = build_provider()
+    app.state.postproc = PostProcessor()
+
+    app.state.asr_scheduler = ASRScheduler(
+        provider=app.state.provider,
+        max_concurrency=_int("ASR_MAX_CONCURRENCY", 6),
+        queue_maxsize=_int("ASR_QUEUE_MAXSIZE", 64),
+        timeout_sec=_float("ASR_TIMEOUT_SEC", 30.0),
+    )
+    await app.state.asr_scheduler.start()
+
+    app.state.diar_scheduler = diar_scheduler.configure(
+        max_concurrency=_int("DIARIZATION_MAX_CONCURRENCY", 2),
+        queue_maxsize=_int("DIARIZATION_QUEUE_MAXSIZE", 32),
+    )
+
+    # ---- multi-tenancy -----------------------------------------------------
+    # Storage is chosen by DATABASE_URL, defaulting to a local SQLite file so
+    # accounts survive a restart. The PostgreSQL commit adds another branch to
+    # build_tenant_repository() and nothing else in the application changes.
+    app.state.tenants = build_tenant_repository()
+    if APP_ENV == "development":
+        # Idempotent: existing rows are left alone, so a password you changed
+        # is not reset to the fixture value on the next boot.
+        await seed_development_tenants(app.state.tenants)
+
+    # Fails closed: outside development this raises until Cognito exists,
+    # rather than serving unauthenticated tenant traffic.
+    app.state.principal_resolver = build_resolver(app.state.tenants, APP_ENV)
+
+    capacity = CapacityManager(
+        max_sessions=_int("MAX_CONCURRENT_SESSIONS", 50),
+        count_fn=app.state.sessions.count,
+    )
+    quotas = QuotaManager(
+        repo=app.state.tenants,
+        count_for_organization=app.state.sessions.count_for_organization,
+    )
+    app.state.admission = AdmissionController(capacity, quotas)
+
     await warmup_backend(settings)
+
+    app.state.warm = True
     log.info("VoxLive ready.")
-    yield
-    state.clear()
-
-
-app = FastAPI(title="VoxLive", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(settings.cors_origins),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "provider": settings.provider,
-        "model": settings.gemini_model,
-        "auth": "vertex" if settings.gemini_use_vertex else "api_key",
-        "languages": list(settings.allowed_languages),
-        "diarization": (
-            resolve_backend(settings.diarization_backend)
-            if settings.diarization_enabled
-            else "off"
-        ),
-        "expected_speakers": settings.expected_speakers,
-        "max_speakers": settings.max_speakers,
-        "diarize_interval_sec": settings.diarize_interval_sec,
-        "diarize_wait_ms": settings.diarize_wait_ms,
-        "context_segments": settings.context_segments,
-    }
-
-
-# ---------------------------------------------------------------------------
-
-
-class Session:
-    """Everything one WebSocket connection owns."""
-
-    def __init__(self, ws: WebSocket, expected_speakers: int):
-        self.ws = ws
-        self.seg = VADSegmenter(
-            sample_rate=settings.sample_rate,
-            vad_aggressiveness=settings.vad_aggressiveness,
-            silence_ms=settings.silence_ms,
-            soft_max_segment_ms=settings.soft_max_segment_ms,
-            max_segment_ms=settings.max_segment_ms,
-            min_segment_ms=settings.min_segment_ms,
-        )
-        self.store = TranscriptStore()
-        self.diar = build_diarizer(settings, expected_speakers)
-        self.diar.on_change = self.on_diarization_change
-
-        self.recent: "deque[str] | None" = (
-            deque(maxlen=settings.context_segments)
-            if settings.context_segments > 0
-            else None
-        )
-        self.asr_slots = asyncio.Semaphore(ASR_CONCURRENCY)
-        self.emit_lock = asyncio.Lock()  # serialises store mutation + sends
-        self.inflight: set[asyncio.Task] = set()
-        self.dead = False
-        self.last_speaker_count = 0
-
-    # ------------------------------------------------------------- outbound
-
-    async def send(self, payload: dict) -> None:
-        if self.dead:
-            return
-        try:
-            await self.ws.send_json(payload)
-        except (WebSocketDisconnect, RuntimeError):
-            self.dead = True
-
-    async def publish(self) -> None:
-        """Emit whatever changed. Caller must hold emit_lock."""
-        paras, mode = self.store.diff()
-        if mode == "none":
-            return
-        if mode == "append":
-            await self.send(paras[-1])
-        else:
-            await self.send(refresh_msg(paras))
-
-        n = self.diar.engine.speaker_count()
-        if n and n != self.last_speaker_count:
-            self.last_speaker_count = n
-            await self.send(speakers_msg(n))
-
-    async def on_diarization_change(self) -> None:
-        """A diarization pass moved the timeline: re-derive every label."""
-        async with self.emit_lock:
-            if self.store.relabel(self.diar.label_for):
-                await self.publish()
-
-    # --------------------------------------------------------------- segment
-
-    async def handle_segment(self, segment: Segment, seg_id: int) -> None:
-        energy = _rms(segment.pcm)
-        if energy < settings.min_segment_rms:
-            log.info(
-                "segment %d gated: rms=%.0f < %d",
-                seg_id,
-                energy,
-                settings.min_segment_rms,
-            )
-            return
-
-        log.info(
-            "segment %d: %.2f-%.2fs (%.2fs, %s) rms=%.0f",
-            seg_id,
-            segment.start,
-            segment.end,
-            segment.duration,
-            segment.reason,
-            energy,
-        )
-
-        # Give the background diarizer a bounded moment to cover this segment,
-        # so the FIRST render already carries the right name. A refresh would
-        # fix it anyway, so this wait is short and never blocks the pipeline.
-        if settings.diarization_enabled and segment.duration >= 1.0:
-            await self.diar.wait_for_coverage(
-                segment.end, timeout=settings.diarize_wait_ms / 1000.0
-            )
-
-        pieces = self._split(segment)
-
-        async with self.emit_lock:
-            chunks = [(self.store.new_chunk(seg_id, a, b), pcm) for pcm, a, b in pieces]
-
-        await self.send(status_msg("transcribing"))
-        context = " ".join(self.recent) if self.recent else None
-
-        async def one(chunk, pcm):
-            async with self.asr_slots:
-                result, limited, err = await self._asr(pcm, context)
-            await self._emit(chunk, result, limited, err, seg_id)
-
-        await asyncio.gather(*(one(c, p) for c, p in chunks))
-        await self.send(status_msg("ready"))
-
-    def _split(self, segment: Segment) -> list[tuple[bytes, float, float]]:
-        """Cut a segment at speaker changes found by the diarizer.
-
-        v7 had a bespoke change-point detector here: sliding 1.5 s windows at a
-        0.4 s hop, 73% overlapped, cut at local maxima above 0.60. Overlapping
-        windows structurally suppress distance except at boundaries, which
-        forced the threshold up into the range where one speaker's own vowel
-        changes also live — so it cut mid-sentence, and the resulting two-voice
-        chunks poisoned the clustering that had to label them.
-
-        The cuts now come from the same clustering that decides identity, so a
-        split and its labels cannot disagree.
-        """
-        sr = settings.sample_rate
-        cuts = self.diar.split_points(segment.start, segment.end)
-        if not cuts:
-            return [(segment.pcm, segment.start, segment.end)]
-
-        bounds = [segment.start, *cuts, segment.end]
-        min_bytes = int(sr * settings.min_segment_ms / 1000) * 2
-        out: list[tuple[bytes, float, float]] = []
-        for a, b in zip(bounds, bounds[1:]):
-            a2 = max(segment.start, a - CHUNK_PAD_PRE_S)
-            b2 = min(segment.end, b + CHUNK_PAD_POST_S)
-            i0 = int((a2 - segment.start) * sr) * 2
-            i1 = int((b2 - segment.start) * sr) * 2
-            piece = segment.pcm[i0:i1]
-            if len(piece) < min_bytes or _rms(piece) < settings.min_segment_rms:
-                continue
-            out.append((piece, a2, b2))
-
-        if not out:
-            return [(segment.pcm, segment.start, segment.end)]
-        log.info(
-            "segment split into %d turn(s) at %s",
-            len(out),
-            ", ".join(f"{c:.2f}s" for c in cuts),
-        )
-        return out
-
-    async def _asr(self, pcm: bytes, context):
-        last_err, limited = None, False
-        for attempt in range(ASR_MAX_RETRIES):
-            try:
-                r = await state["provider"].transcribe_segment(
-                    pcm, settings.sample_rate, context=context
-                )
-                return r, False, None
-            except Exception as e:  # noqa: BLE001
-                if isinstance(e, (WebSocketDisconnect, RuntimeError)):
-                    raise
-                last_err = e
-                if _is_rate_limit(e):
-                    limited = True
-                    log.error("HTTP 429 from Vertex — backing off")
-                    await asyncio.sleep(2**attempt)
-                    continue
-                log.warning(
-                    "ASR attempt %d/%d failed: %s", attempt + 1, ASR_MAX_RETRIES, e
-                )
-                await asyncio.sleep(0.5 * (attempt + 1))
-        return None, limited, last_err
-
-    async def _emit(self, chunk, result, limited, err, seg_id: int) -> None:
-        async with self.emit_lock:
-            if result is None:
-                self.store.drop(chunk)
-                await self.send(
-                    error_msg(
-                        (
-                            "Vertex AI rejected the request (HTTP 429). Please retry."
-                            if limited
-                            else f"transcription failed after {ASR_MAX_RETRIES} retries"
-                        ),
-                        seg_id,
-                    )
-                )
-                return
-
-            if not result.text or result.language not in settings.allowed_languages:
-                if result.text:
-                    log.info("dropped segment %d: lang=%s", seg_id, result.language)
-                self.store.drop(chunk)
-                return
-
-            text = result.text
-            if settings.enable_postprocess:
-                text = await state["postproc"].process(text, result.language)
-
-            # A long output identical to the previous one is a stuck model,
-            # not a person repeating a sentence word for word.
-            if self.recent and len(text) > 25 and self.recent[-1] == text:
-                log.info("repeat guard: segment %d dropped", seg_id)
-                self.store.drop(chunk)
-                return
-            if self.recent is not None:
-                self.recent.append(text)
-
-            chunk.text = text
-            chunk.language = result.language
-            chunk.speaker = self.diar.label_for(chunk.start, chunk.end)
-            if chunk.speaker is None:
-                prev = [
-                    c
-                    for c in self.store.chunks
-                    if c.speaker is not None and c.end <= chunk.start
-                ]
-                chunk.speaker = prev[-1].speaker if prev else 0
-
-            await self.publish()
-
-    async def aclose(self) -> None:
-        await self.diar.aclose()
-
-
-# ---------------------------------------------------------------------------
-
-
-@app.websocket("/ws/transcribe")
-async def transcribe(ws: WebSocket):
-    await ws.accept()
-
-    expected = settings.expected_speakers
-    raw = ws.query_params.get("speakers")
-    if raw:
-        try:
-            expected = max(0, int(raw))
-            log.info("session speaker count: %s (from client)", expected or "auto")
-        except ValueError:
-            pass
-
-    s = Session(ws, expected)
-    s.diar.start()
-
-    queue: asyncio.Queue = asyncio.Queue()
-    await s.send(status_msg("ready"))
-
-    def reap(task: asyncio.Task) -> None:
-        s.inflight.discard(task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            log.error("segment task failed: %s", exc, exc_info=exc)
-
-    async def worker():
-        while True:
-            item = await queue.get()
-            try:
-                if item is None:
-                    if s.inflight:
-                        await asyncio.gather(*list(s.inflight), return_exceptions=True)
-                    return
-                if s.dead:
-                    continue
-                seg_id, segment = item
-                task = asyncio.create_task(s.handle_segment(segment, seg_id))
-                s.inflight.add(task)
-                task.add_done_callback(reap)
-                # Bound the backlog rather than queueing without limit.
-                while len(s.inflight) >= ASR_CONCURRENCY * 2:
-                    await asyncio.wait(
-                        list(s.inflight), return_when=asyncio.FIRST_COMPLETED
-                    )
-            except Exception as e:  # noqa: BLE001
-                log.error("worker error: %s", e)
-                traceback.print_exc()
-                await s.send(error_msg(f"internal error while processing audio: {e}"))
-            finally:
-                queue.task_done()
-
-    worker_task = asyncio.create_task(worker())
-    seg_id = 0
-    last_beat = 0.0
-
     try:
-        while True:
-            msg = await ws.receive()
-
-            if msg.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect(msg.get("code", 1000))
-
-            if msg.get("bytes") is not None:
-                # Raw audio goes to the diarizer CONTINUOUSLY — it does its own
-                # VAD and needs an uninterrupted clock, not VAD segments with
-                # pre-roll padding glued on.
-                s.diar.feed(msg["bytes"])
-                for segment in s.seg.add_audio(msg["bytes"]):
-                    seg_id += 1
-                    queue.put_nowait((seg_id, segment))
-                if s.seg.now - last_beat >= 10.0:
-                    last_beat = s.seg.now
-                    log.info(
-                        "audio: %.0fs received, %d segment(s), diar=%s",
-                        s.seg.now,
-                        seg_id,
-                        s.diar.stats(),
-                    )
-
-            elif msg.get("text") == "stop":
-                segment = s.seg.flush()
-                if segment:
-                    seg_id += 1
-                    queue.put_nowait((seg_id, segment))
-                await queue.join()
-                if s.inflight:
-                    log.info("draining %d in-flight segment(s)", len(s.inflight))
-                    await asyncio.gather(*list(s.inflight), return_exceptions=True)
-
-                # Final pass: every window of the session is available, so this
-                # is plain offline diarization — the best labelling the system
-                # can produce. Always worth one last refresh.
-                try:
-                    await s.diar.finalize()
-                    async with s.emit_lock:
-                        if s.store.relabel(s.diar.label_for):
-                            log.info("final pass corrected the transcript")
-                        await s.send(refresh_msg(s.store.paragraphs()))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("final diarization pass failed: %s", e)
-
-                log.info("session done: %s", s.diar.stats())
-                await s.send(status_msg("stopped"))
-
-    except WebSocketDisconnect:
-        log.info("client disconnected after %d segments", seg_id)
+        yield
     finally:
-        s.dead = True
-        queue.put_nowait(None)
-        try:
-            await asyncio.wait_for(worker_task, timeout=10)
-        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-            worker_task.cancel()
-        await s.aclose()
+        # SIGTERM path. ECS replaces tasks routinely, so this runs often.
+        app.state.warm = False
+        await app.state.sessions.shutdown_all()
+        await app.state.asr_scheduler.stop()
+        diar_scheduler.shutdown()
+        log.info("VoxLive stopped.")
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="VoxLive", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.cors_origins),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.include_router(health_router)
+    app.include_router(auth_router)
+    app.include_router(ws_router)
+    return app
+
+
+app = create_app()

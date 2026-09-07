@@ -10,7 +10,7 @@ gets that wrong, speakers swap names halfway through a meeting.
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.diarizer_sortformer import SortformerDiarizer
+from app.diarization.sortformer import SortformerDiarizer
 
 
 def make():
@@ -129,7 +129,7 @@ def test_label_and_split_lookups():
 
 def test_interface_matches_the_embedding_backend():
     """Both backends must be swappable without main.py branching."""
-    from app.diarization_service import DiarizationService
+    from app.diarization.service import DiarizationService
 
     required = [
         "feed", "start", "aclose", "finalize", "wait_for_coverage",

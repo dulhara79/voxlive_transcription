@@ -29,9 +29,19 @@
  *   <TranscriptView paragraphs={paragraphs} />
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { Fragment, useCallback, useMemo, useState } from "react";
 
 const LANG_LABEL = { si: "සිංහල", en: "English", ta: "தமிழ்" };
+
+// Per-language tint for code-switched turns (Phase 4). Deliberately faint:
+// the transcript is for READING, and a turn that switches five times must not
+// look like a ransom note. Colour is a secondary cue only — the `title`
+// attribute names the language, so this never carries meaning by colour alone.
+const LANG_TINT = {
+  si: "rgba(37,99,235,0.10)",
+  ta: "rgba(217,119,6,0.14)",
+  en: "transparent",
+};
 
 // Distinct, colour-blind-safe accents so two speakers never read as one.
 const SPEAKER_COLORS = [
@@ -48,6 +58,53 @@ function speakerStyle(label) {
   return SPEAKER_COLORS[
     (Number.isFinite(n) ? n - 1 : 0) % SPEAKER_COLORS.length
   ];
+}
+
+/**
+ * Render one paragraph's text split by `language_spans`.
+ *
+ * Spans carry start_char/end_char indexing `text` as a JS slice, so this is a
+ * plain substring walk — no re-detection on the client, and no chance of the
+ * client and server disagreeing about where a switch happened.
+ *
+ * The gaps BETWEEN spans are whitespace (the server guarantees contiguity),
+ * and they are emitted verbatim so the sentence still reads normally. A
+ * paragraph with zero or one span renders as plain text: a monolingual turn
+ * should look exactly as it did before Phase 4.
+ */
+function CodeSwitchedText({ text, spans }) {
+  if (!spans || spans.length < 2) {
+    return <p className="leading-relaxed text-neutral-900">{text}</p>;
+  }
+
+  const parts = [];
+  let cursor = 0;
+  spans.forEach((s, i) => {
+    // Whitespace between the previous span and this one.
+    if (s.start_char > cursor) {
+      parts.push(<span key={`g${i}`}>{text.slice(cursor, s.start_char)}</span>);
+    }
+    parts.push(
+      <span
+        key={`s${i}`}
+        title={LANG_LABEL[s.language] ?? s.language}
+        style={{
+          background: LANG_TINT[s.language] ?? "transparent",
+          borderRadius: "2px",
+        }}
+      >
+        {text.slice(s.start_char, s.end_char)}
+      </span>,
+    );
+    cursor = s.end_char;
+  });
+  // Anything after the final span (trailing whitespace, or text the server
+  // could not attribute). Never dropped: the rendered string must always equal
+  // `text` exactly, whatever the spans say.
+  if (cursor < text.length) {
+    parts.push(<span key="tail">{text.slice(cursor)}</span>);
+  }
+  return <p className="leading-relaxed text-neutral-900">{parts}</p>;
 }
 
 function langLabel(code) {
@@ -112,33 +169,51 @@ export default function TranscriptView({ paragraphs }) {
     <div className="space-y-3">
       {paragraphs.map((p, i) => {
         const c = speakerStyle(p.speaker);
+        const prev = i > 0 ? paragraphs[i - 1] : null;
+        // A RECORDING boundary. Speaker numbers reset when the user starts a
+        // new recording, so "Speaker 1" below the divider is a different human
+        // from "Speaker 1" above it. Without this line the transcript would
+        // show two people under one name with nothing to separate them.
+        const rec = p.recording ?? 1;
+        const isNewRecording = prev != null && (prev.recording ?? 1) !== rec;
         // Only re-announce the speaker when it actually changes: a wall of
         // repeated name badges makes a two-person conversation unreadable.
-        const isNewSpeaker = i === 0 || paragraphs[i - 1].speaker !== p.speaker;
+        const isNewSpeaker =
+          i === 0 || isNewRecording || prev.speaker !== p.speaker;
         return (
-          <div
-            key={p.paragraph_id}
-            className="rounded-lg border border-neutral-200 bg-white p-4 shadow-sm"
-            style={{ borderLeft: `3px solid ${c.bar}` }}
-          >
-            <div className="mb-2 flex items-center gap-2">
-              <span
-                className="rounded px-1.5 py-0.5 text-[11px] font-semibold"
-                style={{ background: c.bg, color: c.fg }}
-              >
-                {p.speaker}
-              </span>
-              {isNewSpeaker && (
-                <span className="text-[11px] text-neutral-400">
-                  {langLabel(p.language)}
+          <Fragment key={p.paragraph_id}>
+            {isNewRecording && (
+              <div className="flex items-center gap-3 pt-2" role="separator">
+                <span className="h-px flex-1 bg-neutral-200" />
+                <span className="text-[11px] font-medium uppercase tracking-wide text-neutral-400">
+                  Recording {rec} · speakers renumbered
                 </span>
-              )}
-              <span className="ml-auto text-[11px] tabular-nums text-neutral-400">
-                {fmtTime(p.start)} – {fmtTime(p.end)}
-              </span>
+                <span className="h-px flex-1 bg-neutral-200" />
+              </div>
+            )}
+            <div
+              className="rounded-lg border border-neutral-200 bg-white p-4 shadow-sm"
+              style={{ borderLeft: `3px solid ${c.bar}` }}
+            >
+              <div className="mb-2 flex items-center gap-2">
+                <span
+                  className="rounded px-1.5 py-0.5 text-[11px] font-semibold"
+                  style={{ background: c.bg, color: c.fg }}
+                >
+                  {p.speaker}
+                </span>
+                {isNewSpeaker && (
+                  <span className="text-[11px] text-neutral-400">
+                    {langLabel(p.language)}
+                  </span>
+                )}
+                <span className="ml-auto text-[11px] tabular-nums text-neutral-400">
+                  {fmtTime(p.start)} – {fmtTime(p.end)}
+                </span>
+              </div>
+              <CodeSwitchedText text={p.text} spans={p.language_spans} />
             </div>
-            <p className="leading-relaxed text-neutral-900">{p.text}</p>
-          </div>
+          </Fragment>
         );
       })}
     </div>

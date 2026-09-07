@@ -24,13 +24,9 @@ desktop.ini
 *.swo
 
 # --- Environment and Secret Files ---
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+C:\Users\dulha\Downloads\GitHub\voxlive-gemini\backend\.env
 .env.*
-*.env
+!.env.example
 
 # --- Sensitive Credentials & Service Accounts ---
 *credentials*.json
@@ -162,3 +158,16 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+backend/.env
+
+# --- VoxLive local state (CREDENTIALS — never commit) ---
+# Tenant database: password hashes for every locally registered account.
+backend/voxlive.db
+backend/voxlive.db-wal
+backend/voxlive.db-shm
+*.db-wal
+*.db-shm
+# Development JWT signing key. Persisted so a backend restart no longer signs
+# everyone out; committing it would let anyone mint tokens for this build.
+backend/.voxlive_dev_secret
+.voxlive_dev_secret
